@@ -1,10 +1,14 @@
 import React, { useState, useEffect } from 'react';
-import { Search, Menu, Bell, Moon } from 'lucide-react';
+import { Search, Menu, Bell, Moon, LogOut } from 'lucide-react';
 import axios from 'axios';
+import Login from './Login';
 
 const API_URL = 'http://localhost:5001/api';
 
 const PortfolioDashboard = () => {
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [username, setUsername] = useState('');
+  const [checkingAuth, setCheckingAuth] = useState(true);
   const [portfolioData, setPortfolioData] = useState(null);
   const [transactions, setTransactions] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -26,15 +30,54 @@ const PortfolioDashboard = () => {
   const [hoveredPoint, setHoveredPoint] = useState(null); // {x, y, date, portfolioValue, benchmarkValue}
 
   useEffect(() => {
-    const initFetch = async () => {
-      await Promise.all([fetchPortfolioData(), fetchTransactions(), fetchWatchlist(), fetchPortfolioHistory(), fetchPortfolioStocks()]);
-    };
-    initFetch();
+    checkAuthStatus();
   }, []);
+
+  useEffect(() => {
+    if (isAuthenticated) {
+      const initFetch = async () => {
+        await Promise.all([fetchPortfolioData(), fetchTransactions(), fetchWatchlist(), fetchPortfolioHistory(), fetchPortfolioStocks()]);
+      };
+      initFetch();
+    }
+  }, [isAuthenticated]);
+
+  const checkAuthStatus = async () => {
+    try {
+      const { data } = await axios.get(`${API_URL}/auth/status`, {
+        withCredentials: true
+      });
+      if (data.success && data.logged_in) {
+        setIsAuthenticated(true);
+        setUsername(data.username);
+      }
+    } catch (err) {
+      console.error('Error checking auth status:', err);
+    } finally {
+      setCheckingAuth(false);
+    }
+  };
+
+  const handleLogin = (loggedInUsername) => {
+    setIsAuthenticated(true);
+    setUsername(loggedInUsername);
+  };
+
+  const handleLogout = async () => {
+    try {
+      await axios.post(`${API_URL}/auth/logout`, {}, { withCredentials: true });
+      setIsAuthenticated(false);
+      setUsername('');
+    } catch (err) {
+      console.error('Error logging out:', err);
+    }
+  };
 
   const fetchPortfolioStocks = async () => {
     try {
-      const { data } = await axios.get(`${API_URL}/portfolio/stocks`);
+      const { data } = await axios.get(`${API_URL}/portfolio/stocks`, {
+        withCredentials: true
+      });
       if (data.success) {
         setAvailableStocks(data.data || []);
         // Select all stocks by default
@@ -47,7 +90,9 @@ const PortfolioDashboard = () => {
 
   const fetchPortfolioData = async () => {
     try {
-      const { data } = await axios.get(`${API_URL}/portfolio/summary`);
+      const { data } = await axios.get(`${API_URL}/portfolio/summary`, {
+        withCredentials: true
+      });
       if (data.success) setPortfolioData(data.data);
       setLoading(false);
     } catch (err) {
@@ -68,7 +113,8 @@ const PortfolioDashboard = () => {
           days: timeframe,
           daily: 'true', // Use daily reconstruction
           ...(symbols && { symbols })
-        }
+        },
+        withCredentials: true
       });
       if (data.success && data.data) {
         // Transform the data to match the chart format
@@ -90,7 +136,8 @@ const PortfolioDashboard = () => {
     }
     try {
       const { data } = await axios.get(`${API_URL}/benchmark/history`, {
-        params: { symbol, days: timeframe }
+        params: { symbol, days: timeframe },
+        withCredentials: true
       });
       if (data.success && data.data) {
         const series = data.data.map(item => ({
@@ -117,7 +164,9 @@ const PortfolioDashboard = () => {
 
   const fetchTransactions = async () => {
     try {
-      const { data } = await axios.get(`${API_URL}/transactions`);
+      const { data } = await axios.get(`${API_URL}/transactions`, {
+        withCredentials: true
+      });
       if (data.success) setTransactions(data.data);
     } catch (err) {
       console.error('Error fetching transactions:', err);
@@ -126,7 +175,9 @@ const PortfolioDashboard = () => {
 
   const fetchWatchlist = async () => {
     try {
-      const { data } = await axios.get(`${API_URL}/watchlist`);
+      const { data } = await axios.get(`${API_URL}/watchlist`, {
+        withCredentials: true
+      });
       if (data.success) {
         setWatchlist(data.data || []);
         await fetchWatchlistQuotes(data.data || []);
@@ -140,7 +191,8 @@ const PortfolioDashboard = () => {
     try {
       const unique = Array.from(new Set(symbols)).slice(0, 20);
       const { data } = await axios.get(`${API_URL}/watchlist/quotes`, {
-        params: { symbols: unique.join(',') }
+        params: { symbols: unique.join(',') },
+        withCredentials: true
       });
       if (data.success) {
         setWatchlistQuotes(data.data || []);
@@ -167,6 +219,21 @@ const PortfolioDashboard = () => {
     }
     return String(val);
   };
+
+  if (checkingAuth) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+        <div className="text-center">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto"></div>
+          <p className="mt-4 text-gray-600">Checking authentication...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!isAuthenticated) {
+    return <Login onLogin={handleLogin} />;
+  }
 
   if (loading) {
     return (
@@ -744,9 +811,18 @@ const PortfolioDashboard = () => {
               <Bell className="w-5 h-5" />
               <span className="absolute top-1 right-1 w-2 h-2 bg-orange-500 rounded-full"></span>
             </button>
-            <div className="flex items-center gap-2 cursor-pointer">
-              <div className="w-10 h-10 bg-blue-500 rounded-full"></div>
-              <span className="font-medium">Portfolio</span>
+            <div className="flex items-center gap-4">
+              <div className="flex items-center gap-2 cursor-pointer">
+                <div className="w-10 h-10 bg-blue-500 rounded-full"></div>
+                <span className="font-medium">{username}</span>
+              </div>
+              <button
+                onClick={handleLogout}
+                className="p-2 hover:bg-gray-100 rounded-lg"
+                title="Logout"
+              >
+                <LogOut className="w-5 h-5" />
+              </button>
             </div>
           </div>
         </div>

@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, session
 from flask_cors import CORS
 import os
 from datetime import datetime, timedelta
@@ -6,20 +6,58 @@ from snaptrade_client import SnapTrade
 import json
 import yfinance as yf
 import logging
+import hashlib
+import secrets
 
 app = Flask(__name__)
-CORS(app)
+app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
+CORS(app, supports_credentials=True)
 
-# Initialize SnapTrade client
-snaptrade = SnapTrade(
-    client_id="CORNELL-UNIVERSITY-RESEARCH-TEST-ICBSL",
-    consumer_key="bKh7Iq0NKEu0sdmEZEdzhbKsucQXffLLomqJTBEjQPCasweaJA"
-)
+# User database file
+USERS_DB_FILE = 'users.json'
 
-# User credentials
-USER_ID = "yuchen-user-1280"
-# WARNING: Do not commit secrets in production
-USER_SECRET = "2f5cb3b6-a796-44fd-9eae-0dfa5a8c005e"
+def load_users():
+    """Load users from JSON file"""
+    if os.path.exists(USERS_DB_FILE):
+        try:
+            with open(USERS_DB_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
+def save_users(users):
+    """Save users to JSON file"""
+    with open(USERS_DB_FILE, 'w') as f:
+        json.dump(users, f, indent=2)
+
+def hash_password(password):
+    """Hash password using SHA256"""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def get_current_user():
+    """Get current logged-in user from session"""
+    if 'username' in session:
+        users = load_users()
+        return users.get(session['username'])
+    return None
+
+def get_snaptrade_client():
+    """Get SnapTrade client for current user"""
+    user = get_current_user()
+    if user:
+        return SnapTrade(
+            client_id=user['snaptrade_client_id'],
+            consumer_key=user['snaptrade_consumer_key']
+        )
+    return None
+
+def get_user_credentials():
+    """Get user credentials for current user"""
+    user = get_current_user()
+    if user:
+        return user['snaptrade_user_id'], user['snaptrade_user_secret']
+    return None, None
 
 WATCHLIST = [
     'AAPL','MSFT','GOOGL','AMZN','NVDA','META','TSLA','BRK.B','JPM','V',
@@ -56,9 +94,17 @@ def generate_history(total_value: float, days: int = 180):
 def get_account_id():
     """Get the first account ID for the user"""
     try:
-        accounts_response = snaptrade.account_information.list_user_accounts(
-            user_id=USER_ID,
-            user_secret=USER_SECRET
+        user_id, user_secret = get_user_credentials()
+        if not user_id or not user_secret:
+            return None
+        
+        snaptrade_client = get_snaptrade_client()
+        if not snaptrade_client:
+            return None
+            
+        accounts_response = snaptrade_client.account_information.list_user_accounts(
+            user_id=user_id,
+            user_secret=user_secret
         )
         if accounts_response.body:
             return accounts_response.body[0]['id']
@@ -75,9 +121,17 @@ def get_portfolio_positions():
         if not account_id:
             return []
 
-        positions_response = snaptrade.account_information.get_user_account_positions(
-            user_id=USER_ID,
-            user_secret=USER_SECRET,
+        user_id, user_secret = get_user_credentials()
+        if not user_id or not user_secret:
+            return []
+
+        snaptrade_client = get_snaptrade_client()
+        if not snaptrade_client:
+            return []
+
+        positions_response = snaptrade_client.account_information.get_user_account_positions(
+            user_id=user_id,
+            user_secret=user_secret,
             account_id=account_id
         )
         return positions_response.body if positions_response.body else []
@@ -90,6 +144,8 @@ def get_portfolio_positions():
 def get_positions():
     """Get portfolio positions"""
     try:
+        if not get_current_user():
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
         positions = get_portfolio_positions()
         return jsonify({
             'success': True,
@@ -106,6 +162,8 @@ def get_positions():
 def get_portfolio_summary():
     """Get portfolio summary with total value and performance"""
     try:
+        if not get_current_user():
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
         positions = get_portfolio_positions()
 
         total_value = 0
@@ -163,13 +221,117 @@ def get_portfolio_summary():
         }), 500
 
 
+@app.route('/api/auth/register', methods=['POST'])
+def register():
+    """Register a new user account"""
+    try:
+        data = request.get_json()
+        username = data.get('username', '').strip()
+        password = data.get('password', '').strip()
+        snaptrade_client_id = data.get('snaptrade_client_id', '').strip()
+        snaptrade_consumer_key = data.get('snaptrade_consumer_key', '').strip()
+        snaptrade_user_id = data.get('snaptrade_user_id', '').strip()
+        snaptrade_user_secret = data.get('snaptrade_user_secret', '').strip()
+        
+        if not all([username, password, snaptrade_client_id, snaptrade_consumer_key, snaptrade_user_id, snaptrade_user_secret]):
+            return jsonify({'success': False, 'error': 'All fields are required'}), 400
+        
+        users = load_users()
+        if username in users:
+            return jsonify({'success': False, 'error': 'Username already exists'}), 400
+        
+        # Verify Snaptrade credentials by trying to connect
+        try:
+            test_client = SnapTrade(
+                client_id=snaptrade_client_id,
+                consumer_key=snaptrade_consumer_key
+            )
+            # Try to list accounts to verify credentials
+            test_client.account_information.list_user_accounts(
+                user_id=snaptrade_user_id,
+                user_secret=snaptrade_user_secret
+            )
+        except Exception as e:
+            return jsonify({'success': False, 'error': f'Invalid Snaptrade credentials: {str(e)}'}), 400
+        
+        # Save user
+        users[username] = {
+            'username': username,
+            'password_hash': hash_password(password),
+            'snaptrade_client_id': snaptrade_client_id,
+            'snaptrade_consumer_key': snaptrade_consumer_key,
+            'snaptrade_user_id': snaptrade_user_id,
+            'snaptrade_user_secret': snaptrade_user_secret,
+            'created_at': datetime.now().isoformat()
+        }
+        save_users(users)
+        
+        return jsonify({'success': True, 'message': 'Account created successfully'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/auth/login', methods=['POST'])
+def login():
+    """Login user"""
+    try:
+        data = request.get_json()
+        username = data.get('username', '').strip()
+        password = data.get('password', '').strip()
+        
+        if not username or not password:
+            return jsonify({'success': False, 'error': 'Username and password are required'}), 400
+        
+        users = load_users()
+        user = users.get(username)
+        
+        if not user or user['password_hash'] != hash_password(password):
+            return jsonify({'success': False, 'error': 'Invalid username or password'}), 401
+        
+        session['username'] = username
+        return jsonify({
+            'success': True,
+            'message': 'Login successful',
+            'username': username
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/auth/logout', methods=['POST'])
+def logout():
+    """Logout user"""
+    session.pop('username', None)
+    return jsonify({'success': True, 'message': 'Logged out successfully'})
+
+@app.route('/api/auth/status', methods=['GET'])
+def auth_status():
+    """Check if user is logged in"""
+    user = get_current_user()
+    if user:
+        return jsonify({
+            'success': True,
+            'logged_in': True,
+            'username': user['username']
+        })
+    return jsonify({
+        'success': True,
+        'logged_in': False
+    })
+
 @app.route('/api/accounts', methods=['GET'])
 def get_accounts():
     """Get user accounts"""
     try:
-        accounts_response = snaptrade.account_information.list_user_accounts(
-            user_id=USER_ID,
-            user_secret=USER_SECRET
+        user_id, user_secret = get_user_credentials()
+        if not user_id or not user_secret:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+        
+        snaptrade_client = get_snaptrade_client()
+        if not snaptrade_client:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+        
+        accounts_response = snaptrade_client.account_information.list_user_accounts(
+            user_id=user_id,
+            user_secret=user_secret
         )
 
         return jsonify({
@@ -187,10 +349,18 @@ def get_accounts():
 def get_transactions():
     """Get recent transactions"""
     try:
+        user_id, user_secret = get_user_credentials()
+        if not user_id or not user_secret:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+        
+        snaptrade_client = get_snaptrade_client()
+        if not snaptrade_client:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+        
         # Note: Newer SDK versions deprecate account_id kwarg. Call without it.
-        activities_response = snaptrade.transactions_and_reporting.get_activities(
-            user_id=USER_ID,
-            user_secret=USER_SECRET
+        activities_response = snaptrade_client.transactions_and_reporting.get_activities(
+            user_id=user_id,
+            user_secret=user_secret
         )
 
         transactions = []
@@ -231,6 +401,8 @@ def get_transactions():
 def get_portfolio_stocks():
     """Get list of all stocks in portfolio for filtering"""
     try:
+        if not get_current_user():
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
         positions = get_portfolio_positions()
         stocks = []
         seen_symbols = set()
@@ -270,6 +442,8 @@ def get_portfolio_stocks():
 def get_portfolio_history():
     """Return historical portfolio values - prefer daily reconstruction, fallback to Snaptrade weekly data"""
     try:
+        if not get_current_user():
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
         days = int(request.args.get('days', 30))
         use_daily = request.args.get('daily', 'true').lower() == 'true'
         selected_symbols = request.args.get('symbols', '').split(',') if request.args.get('symbols') else []
@@ -334,10 +508,18 @@ def get_portfolio_history():
         start_date = end_date - timedelta(days=days)
         
         try:
+            user_id, user_secret = get_user_credentials()
+            if not user_id or not user_secret:
+                raise Exception('Not authenticated')
+            
+            snaptrade_client = get_snaptrade_client()
+            if not snaptrade_client:
+                raise Exception('Not authenticated')
+            
             # Try get_reporting_custom_range for historical portfolio data
-            reporting_response = snaptrade.transactions_and_reporting.get_reporting_custom_range(
-                user_id=USER_ID,
-                user_secret=USER_SECRET,
+            reporting_response = snaptrade_client.transactions_and_reporting.get_reporting_custom_range(
+                user_id=user_id,
+                user_secret=user_secret,
                 start_date=start_date.strftime('%Y-%m-%d'),
                 end_date=end_date.strftime('%Y-%m-%d')
             )
@@ -380,9 +562,17 @@ def get_portfolio_history():
         
         # Try get_user_account_return_rates as alternative
         try:
-            return_rates_response = snaptrade.account_information.get_user_account_return_rates(
-                user_id=USER_ID,
-                user_secret=USER_SECRET,
+            user_id, user_secret = get_user_credentials()
+            if not user_id or not user_secret:
+                raise Exception('Not authenticated')
+            
+            snaptrade_client = get_snaptrade_client()
+            if not snaptrade_client:
+                raise Exception('Not authenticated')
+            
+            return_rates_response = snaptrade_client.account_information.get_user_account_return_rates(
+                user_id=user_id,
+                user_secret=user_secret,
                 account_id=account_id
             )
             
@@ -465,6 +655,8 @@ def get_benchmark_history():
 def get_daily_portfolio():
     """Reconstruct daily portfolio values from individual stock prices"""
     try:
+        if not get_current_user():
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
         account_id = get_account_id()
         if not account_id:
             return jsonify({'success': False, 'error': 'No account found'}), 400
@@ -801,9 +993,17 @@ def export_account_data():
             return jsonify({'success': False, 'error': 'No account found'}), 400
         
         # Get all account data
-        accounts_response = snaptrade.account_information.list_user_accounts(
-            user_id=USER_ID,
-            user_secret=USER_SECRET
+        user_id, user_secret = get_user_credentials()
+        if not user_id or not user_secret:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+        
+        snaptrade_client = get_snaptrade_client()
+        if not snaptrade_client:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+        
+        accounts_response = snaptrade_client.account_information.list_user_accounts(
+            user_id=user_id,
+            user_secret=user_secret
         )
         
         positions = get_portfolio_positions()
@@ -814,9 +1014,9 @@ def export_account_data():
         start_date = end_date - timedelta(days=365)
         reporting_data = None
         try:
-            reporting_response = snaptrade.transactions_and_reporting.get_reporting_custom_range(
-                user_id=USER_ID,
-                user_secret=USER_SECRET,
+            reporting_response = snaptrade_client.transactions_and_reporting.get_reporting_custom_range(
+                user_id=user_id,
+                user_secret=user_secret,
                 start_date=start_date.strftime('%Y-%m-%d'),
                 end_date=end_date.strftime('%Y-%m-%d')
             )

@@ -1,0 +1,7 @@
+node_modules/
+frontend/node_modules/
+backend/venv/
+*.pyc
+__pycache__/
+*.cache
+data-export/account-data.json

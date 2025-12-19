@@ -11,10 +11,19 @@ import secrets
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
-CORS(app, supports_credentials=True)
+CORS(app, supports_credentials=True, origins=['http://localhost:3000', 'http://localhost:3001', 'http://127.0.0.1:3000', 'http://127.0.0.1:3001'])
 
-# User database file
+# Configuration
+SNAPTRADE_CLIENT_ID = "CORNELL-UNIVERSITY-RESEARCH-TEST-ICBSL"
+SNAPTRADE_CONSUMER_KEY = "bKh7Iq0NKEu0sdmEZEdzhbKsucQXffLLomqJTBEjQPCasweaJA"
+
+# Database files
 USERS_DB_FILE = 'users.json'
+ACCOUNT_DATA_DIR = 'data-export'
+ACCOUNT_DATA_FILE = os.path.join(ACCOUNT_DATA_DIR, 'account-data.json')
+
+# Ensure data-export directory exists
+os.makedirs(ACCOUNT_DATA_DIR, exist_ok=True)
 
 def load_users():
     """Load users from JSON file"""
@@ -31,6 +40,21 @@ def save_users(users):
     with open(USERS_DB_FILE, 'w') as f:
         json.dump(users, f, indent=2)
 
+def load_account_data():
+    """Load account data from JSON file"""
+    if os.path.exists(ACCOUNT_DATA_FILE):
+        try:
+            with open(ACCOUNT_DATA_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
+def save_account_data(account_data):
+    """Save account data to JSON file"""
+    with open(ACCOUNT_DATA_FILE, 'w') as f:
+        json.dump(account_data, f, indent=2)
+
 def hash_password(password):
     """Hash password using SHA256"""
     return hashlib.sha256(password.encode()).hexdigest()
@@ -43,20 +67,17 @@ def get_current_user():
     return None
 
 def get_snaptrade_client():
-    """Get SnapTrade client for current user"""
-    user = get_current_user()
-    if user:
-        return SnapTrade(
-            client_id=user['snaptrade_client_id'],
-            consumer_key=user['snaptrade_consumer_key']
-        )
-    return None
+    """Get SnapTrade client with global credentials"""
+    return SnapTrade(
+        client_id=SNAPTRADE_CLIENT_ID,
+        consumer_key=SNAPTRADE_CONSUMER_KEY
+    )
 
 def get_user_credentials():
     """Get user credentials for current user"""
     user = get_current_user()
     if user:
-        return user['snaptrade_user_id'], user['snaptrade_user_secret']
+        return user.get('snaptrade_user_id'), user.get('snaptrade_user_secret')
     return None, None
 
 WATCHLIST = [
@@ -94,14 +115,22 @@ def generate_history(total_value: float, days: int = 180):
 def get_account_id():
     """Get the first account ID for the user"""
     try:
+        user = get_current_user()
+        if not user:
+            return None
+        
+        # Try to get from stored account data first
+        account_data = load_account_data()
+        user_accounts = account_data.get(user['username'], {}).get('accounts', [])
+        if user_accounts and len(user_accounts) > 0:
+            return user_accounts[0].get('id')
+        
+        # Otherwise fetch from Snaptrade
         user_id, user_secret = get_user_credentials()
         if not user_id or not user_secret:
             return None
         
         snaptrade_client = get_snaptrade_client()
-        if not snaptrade_client:
-            return None
-            
         accounts_response = snaptrade_client.account_information.list_user_accounts(
             user_id=user_id,
             user_secret=user_secret
@@ -126,9 +155,6 @@ def get_portfolio_positions():
             return []
 
         snaptrade_client = get_snaptrade_client()
-        if not snaptrade_client:
-            return []
-
         positions_response = snaptrade_client.account_information.get_user_account_positions(
             user_id=user_id,
             user_secret=user_secret,
@@ -223,52 +249,161 @@ def get_portfolio_summary():
 
 @app.route('/api/auth/register', methods=['POST'])
 def register():
-    """Register a new user account"""
+    """Register a new user account and create Snaptrade user"""
     try:
         data = request.get_json()
         username = data.get('username', '').strip()
         password = data.get('password', '').strip()
-        snaptrade_client_id = data.get('snaptrade_client_id', '').strip()
-        snaptrade_consumer_key = data.get('snaptrade_consumer_key', '').strip()
-        snaptrade_user_id = data.get('snaptrade_user_id', '').strip()
-        snaptrade_user_secret = data.get('snaptrade_user_secret', '').strip()
         
-        if not all([username, password, snaptrade_client_id, snaptrade_consumer_key, snaptrade_user_id, snaptrade_user_secret]):
-            return jsonify({'success': False, 'error': 'All fields are required'}), 400
+        if not username or not password:
+            return jsonify({'success': False, 'error': 'Username and password are required'}), 400
         
         users = load_users()
         if username in users:
             return jsonify({'success': False, 'error': 'Username already exists'}), 400
         
-        # Verify Snaptrade credentials by trying to connect
+        # Step 1: Register user with Snaptrade
+        snaptrade_client = get_snaptrade_client()
         try:
-            test_client = SnapTrade(
-                client_id=snaptrade_client_id,
-                consumer_key=snaptrade_consumer_key
+            register_response = snaptrade_client.authentication.register_snap_trade_user(
+                body={'userId': username}
             )
-            # Try to list accounts to verify credentials
-            test_client.account_information.list_user_accounts(
-                user_id=snaptrade_user_id,
-                user_secret=snaptrade_user_secret
-            )
+            
+            if not register_response.body:
+                return jsonify({'success': False, 'error': 'Failed to register with Snaptrade'}), 500
+            
+            user_id = register_response.body.get('userId')
+            user_secret = register_response.body.get('userSecret')
+            
+            if not user_id or not user_secret:
+                return jsonify({'success': False, 'error': 'Invalid Snaptrade response'}), 500
+            
         except Exception as e:
-            return jsonify({'success': False, 'error': f'Invalid Snaptrade credentials: {str(e)}'}), 400
+            return jsonify({'success': False, 'error': f'Snaptrade registration failed: {str(e)}'}), 500
         
-        # Save user
+        # Step 2: Generate login URL for brokerage connection
+        try:
+            login_response = snaptrade_client.authentication.login_snap_trade_user(
+                body={
+                    'userId': user_id,
+                    'userSecret': user_secret
+                }
+            )
+            
+            if not login_response.body:
+                return jsonify({'success': False, 'error': 'Failed to generate connection URL'}), 500
+            
+            redirect_uri = login_response.body.get('redirectURI')
+            session_id = login_response.body.get('sessionId')
+            
+            if not redirect_uri:
+                return jsonify({'success': False, 'error': 'Invalid connection URL response'}), 500
+            
+        except Exception as e:
+            return jsonify({'success': False, 'error': f'Failed to generate connection URL: {str(e)}'}), 500
+        
+        # Step 3: Save user data (without logging them in yet)
         users[username] = {
             'username': username,
             'password_hash': hash_password(password),
-            'snaptrade_client_id': snaptrade_client_id,
-            'snaptrade_consumer_key': snaptrade_consumer_key,
-            'snaptrade_user_id': snaptrade_user_id,
-            'snaptrade_user_secret': snaptrade_user_secret,
+            'snaptrade_user_id': user_id,
+            'snaptrade_user_secret': user_secret,
+            'redirect_uri': redirect_uri,
+            'session_id': session_id,
+            'account_connected': False,
             'created_at': datetime.now().isoformat()
         }
         save_users(users)
         
-        return jsonify({'success': True, 'message': 'Account created successfully'})
+        return jsonify({
+            'success': True,
+            'message': 'Account created successfully',
+            'redirectURI': redirect_uri,
+            'sessionId': session_id
+        })
+        
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/auth/complete-setup', methods=['POST'])
+def complete_setup():
+    """Complete account setup by fetching and storing account data"""
+    try:
+        data = request.get_json()
+        username = data.get('username', '').strip()
+        
+        if not username:
+            return jsonify({'success': False, 'error': 'Username is required'}), 400
+        
+        users = load_users()
+        user = users.get(username)
+        
+        if not user:
+            return jsonify({'success': False, 'error': 'User not found'}), 404
+        
+        user_id = user.get('snaptrade_user_id')
+        user_secret = user.get('snaptrade_user_secret')
+        
+        if not user_id or not user_secret:
+            return jsonify({'success': False, 'error': 'Invalid user credentials'}), 400
+        
+        # Fetch account information from Snaptrade
+        snaptrade_client = get_snaptrade_client()
+        try:
+            accounts_response = snaptrade_client.account_information.list_user_accounts(
+                user_id=user_id,
+                user_secret=user_secret
+            )
+            
+            if not accounts_response.body:
+                return jsonify({'success': False, 'error': 'No accounts found. Please connect your brokerage account first.'}), 400
+            
+            accounts = accounts_response.body
+            
+        except Exception as e:
+            return jsonify({'success': False, 'error': f'Failed to fetch accounts: {str(e)}'}), 500
+        
+        # Fetch detailed account information for the first account
+        if len(accounts) > 0:
+            account_id = accounts[0].get('id')
+            try:
+                account_details_response = snaptrade_client.account_information.get_user_account_details(
+                    account_id=account_id,
+                    user_id=user_id,
+                    user_secret=user_secret
+                )
+                account_details = account_details_response.body if account_details_response.body else accounts[0]
+            except Exception as e:
+                print(f"Error fetching account details: {e}")
+                account_details = accounts[0]
+        else:
+            account_details = None
+        
+        # Store account data
+        account_data = load_account_data()
+        account_data[username] = {
+            'username': username,
+            'accounts': accounts,
+            'primary_account': account_details,
+            'fetched_at': datetime.now().isoformat()
+        }
+        save_account_data(account_data)
+        
+        # Update user status
+        users[username]['account_connected'] = True
+        users[username]['accounts_fetched_at'] = datetime.now().isoformat()
+        save_users(users)
+        
+        return jsonify({
+            'success': True,
+            'message': 'Account setup completed successfully',
+            'accounts': accounts
+        })
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 
 @app.route('/api/auth/login', methods=['POST'])
 def login():
@@ -286,6 +421,14 @@ def login():
         
         if not user or user['password_hash'] != hash_password(password):
             return jsonify({'success': False, 'error': 'Invalid username or password'}), 401
+        
+        # Check if account is connected
+        if not user.get('account_connected', False):
+            return jsonify({
+                'success': False,
+                'error': 'Account setup not completed. Please complete brokerage connection.',
+                'needs_setup': True
+            }), 403
         
         session['username'] = username
         return jsonify({
@@ -321,14 +464,26 @@ def auth_status():
 def get_accounts():
     """Get user accounts"""
     try:
+        user = get_current_user()
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+        
+        # Try to get from stored account data first
+        account_data = load_account_data()
+        user_accounts = account_data.get(user['username'], {}).get('accounts', [])
+        
+        if user_accounts:
+            return jsonify({
+                'success': True,
+                'data': user_accounts
+            })
+        
+        # Otherwise fetch from Snaptrade
         user_id, user_secret = get_user_credentials()
         if not user_id or not user_secret:
             return jsonify({'success': False, 'error': 'Not authenticated'}), 401
         
         snaptrade_client = get_snaptrade_client()
-        if not snaptrade_client:
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-        
         accounts_response = snaptrade_client.account_information.list_user_accounts(
             user_id=user_id,
             user_secret=user_secret
@@ -354,10 +509,7 @@ def get_transactions():
             return jsonify({'success': False, 'error': 'Not authenticated'}), 401
         
         snaptrade_client = get_snaptrade_client()
-        if not snaptrade_client:
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
         
-        # Note: Newer SDK versions deprecate account_id kwarg. Call without it.
         activities_response = snaptrade_client.transactions_and_reporting.get_activities(
             user_id=user_id,
             user_secret=user_secret
@@ -366,7 +518,7 @@ def get_transactions():
         transactions = []
         body = getattr(activities_response, 'body', None) or []
         if body:
-            for activity in body[:10]:  # Get last 10 transactions
+            for activity in body[:10]:
                 raw_symbol = activity.get('symbol')
                 if isinstance(raw_symbol, dict):
                     norm_symbol = raw_symbol.get('symbol') or raw_symbol.get('raw_symbol') or 'N/A'
@@ -390,7 +542,6 @@ def get_transactions():
         })
     except Exception as e:
         print(f"Error getting transactions: {e}")
-        # Be resilient: return empty transactions on error so UI stays functional
         return jsonify({
             'success': True,
             'data': []
@@ -414,11 +565,9 @@ def get_portfolio_stocks():
                 current_price = position.get('price', 0)
                 market_value = current_price * quantity
                 
-                # Extract name from nested symbol structure
-                name = sym  # Default to symbol
+                name = sym
                 symbol_obj = position.get('symbol')
                 if isinstance(symbol_obj, dict):
-                    # Try to get description from nested structure
                     inner_symbol = symbol_obj.get('symbol')
                     if isinstance(inner_symbol, dict):
                         name = inner_symbol.get('description', symbol_obj.get('description', sym))
@@ -440,7 +589,7 @@ def get_portfolio_stocks():
 
 @app.route('/api/portfolio/history', methods=['GET'])
 def get_portfolio_history():
-    """Return historical portfolio values - prefer daily reconstruction, fallback to Snaptrade weekly data"""
+    """Return historical portfolio values"""
     try:
         if not get_current_user():
             return jsonify({'success': False, 'error': 'Not authenticated'}), 401
@@ -449,18 +598,15 @@ def get_portfolio_history():
         selected_symbols = request.args.get('symbols', '').split(',') if request.args.get('symbols') else []
         selected_symbols = [s.strip().upper() for s in selected_symbols if s.strip()]
         
-        # Try daily reconstruction first (more accurate)
         if use_daily:
             try:
                 account_id = get_account_id()
                 if account_id:
                     positions = get_portfolio_positions()
                     if positions:
-                        # Reconstruct daily from individual stocks
                         end_date = datetime.now()
                         start_date = end_date - timedelta(days=days)
                         
-                        # Filter by selected symbols if provided
                         if selected_symbols:
                             positions = [p for p in positions if _get_symbol_from_position(p) in selected_symbols]
                         
@@ -474,7 +620,6 @@ def get_portfolio_history():
                                 if quantity > 0:
                                     symbol_quantities[sym] = symbol_quantities.get(sym, 0) + quantity
                         
-                        # Fetch daily prices for each symbol
                         for symbol, quantity in symbol_quantities.items():
                             try:
                                 ticker = yf.Ticker(symbol)
@@ -495,112 +640,6 @@ def get_portfolio_history():
             except Exception as e:
                 print(f"Daily reconstruction failed, falling back: {e}")
         
-        # Fallback to Snaptrade weekly data
-        account_id = get_account_id()
-        if not account_id:
-            # Fallback to synthetic if no account
-            summary = get_portfolio_summary().json
-            total_value = summary.get('data', {}).get('totalValue', 0) if summary else 0
-            history = generate_history(total_value, days)
-            return jsonify({'success': True, 'data': history})
-        
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=days)
-        
-        try:
-            user_id, user_secret = get_user_credentials()
-            if not user_id or not user_secret:
-                raise Exception('Not authenticated')
-            
-            snaptrade_client = get_snaptrade_client()
-            if not snaptrade_client:
-                raise Exception('Not authenticated')
-            
-            # Try get_reporting_custom_range for historical portfolio data
-            reporting_response = snaptrade_client.transactions_and_reporting.get_reporting_custom_range(
-                user_id=user_id,
-                user_secret=user_secret,
-                start_date=start_date.strftime('%Y-%m-%d'),
-                end_date=end_date.strftime('%Y-%m-%d')
-            )
-            
-            if reporting_response.body:
-                # Process the reporting data to extract portfolio values over time
-                history = []
-                reporting_data = reporting_response.body
-                
-                # Snaptrade returns data in totalEquityTimeframe array
-                if isinstance(reporting_data, dict) and 'totalEquityTimeframe' in reporting_data:
-                    time_series = reporting_data.get('totalEquityTimeframe', [])
-                    for entry in time_series:
-                        if 'date' in entry and 'value' in entry:
-                            history.append({
-                                'date': entry['date'],
-                                'value': float(entry.get('value', 0))
-                            })
-                # Fallback: check for other possible structures
-                elif isinstance(reporting_data, dict) and 'data' in reporting_data:
-                    time_series = reporting_data.get('data', [])
-                    for entry in time_series:
-                        if 'date' in entry and 'total_value' in entry:
-                            history.append({
-                                'date': entry['date'],
-                                'value': float(entry.get('total_value', 0))
-                            })
-                        elif 'date' in entry and 'value' in entry:
-                            history.append({
-                                'date': entry['date'],
-                                'value': float(entry.get('value', 0))
-                            })
-                
-                if history:
-                    # Sort by date to ensure chronological order
-                    history.sort(key=lambda x: x['date'])
-                    return jsonify({'success': True, 'data': history})
-        except Exception as e:
-            print(f"Error fetching Snaptrade reporting data: {e}")
-        
-        # Try get_user_account_return_rates as alternative
-        try:
-            user_id, user_secret = get_user_credentials()
-            if not user_id or not user_secret:
-                raise Exception('Not authenticated')
-            
-            snaptrade_client = get_snaptrade_client()
-            if not snaptrade_client:
-                raise Exception('Not authenticated')
-            
-            return_rates_response = snaptrade_client.account_information.get_user_account_return_rates(
-                user_id=user_id,
-                user_secret=user_secret,
-                account_id=account_id
-            )
-            
-            if return_rates_response.body:
-                # Process return rates to build historical portfolio values
-                rates_data = return_rates_response.body
-                current_summary = get_portfolio_summary().json
-                current_value = current_summary.get('data', {}).get('totalValue', 0) if current_summary else 0
-                
-                # If we have return rates, we can calculate historical values
-                if isinstance(rates_data, dict) and 'data' in rates_data:
-                    history = []
-                    # Build history backwards from current value using return rates
-                    # This is a simplified approach - adjust based on actual API response structure
-                    for i in range(days):
-                        day = end_date - timedelta(days=(days - 1 - i))
-                        # Use current value as base (in real implementation, would use actual historical rates)
-                        history.append({
-                            'date': day.strftime('%Y-%m-%d'),
-                            'value': current_value  # Placeholder - would need actual historical data
-                        })
-                    
-                    if history:
-                        return jsonify({'success': True, 'data': history})
-        except Exception as e:
-            print(f"Error fetching Snaptrade return rates: {e}")
-        
-        # Fallback to synthetic data based on current portfolio value
         summary = get_portfolio_summary().json
         total_value = summary.get('data', {}).get('totalValue', 0) if summary else 0
         history = generate_history(total_value, days)
@@ -608,31 +647,26 @@ def get_portfolio_history():
         
     except Exception as e:
         print(f"Error in get_portfolio_history: {e}")
-        # Final fallback
         return jsonify({'success': True, 'data': generate_history(10000, 180)})
 
 
 @app.route('/api/benchmark/history', methods=['GET'])
 def get_benchmark_history():
-    """Get historical data for benchmark (market index like SPY) with dividend-adjusted prices"""
+    """Get historical data for benchmark"""
     try:
         symbol = request.args.get('symbol', 'SPY').upper()
         days = int(request.args.get('days', 180))
         
-        # Fetch historical data using yfinance
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days)
         
         try:
             ticker = yf.Ticker(symbol)
-            # Use auto_adjust=True to get dividend-adjusted prices
             hist = ticker.history(start=start_date, end=end_date, auto_adjust=True, interval='1d')
             
             if hist is not None and len(hist) > 0:
                 history = []
                 for date, row in hist.iterrows():
-                    # Use Adj Close which includes dividend adjustments
-                    # If auto_adjust=True, Close and Adj Close should be the same
                     price = float(row.get('Adj Close', row.get('Close', 0)))
                     history.append({
                         'date': date.strftime('%Y-%m-%d'),
@@ -651,89 +685,12 @@ def get_benchmark_history():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
-@app.route('/api/portfolio/daily', methods=['GET'])
-def get_daily_portfolio():
-    """Reconstruct daily portfolio values from individual stock prices"""
-    try:
-        if not get_current_user():
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-        account_id = get_account_id()
-        if not account_id:
-            return jsonify({'success': False, 'error': 'No account found'}), 400
-        
-        days = int(request.args.get('days', 30))
-        selected_symbols = request.args.get('symbols', '').split(',') if request.args.get('symbols') else []
-        selected_symbols = [s.strip().upper() for s in selected_symbols if s.strip()]
-        
-        # Get current positions
-        positions = get_portfolio_positions()
-        if not positions:
-            return jsonify({'success': False, 'error': 'No positions found'}), 400
-        
-        # Filter by selected symbols if provided
-        if selected_symbols:
-            positions = [p for p in positions if _get_symbol_from_position(p) in selected_symbols]
-        
-        # Get date range
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=days)
-        
-        # Build daily portfolio reconstruction
-        daily_values = {}
-        stock_data = {}
-        
-        # First, get all unique symbols and their quantities
-        symbol_quantities = {}
-        for position in positions:
-            sym = _get_symbol_from_position(position)
-            if sym and sym != 'N/A':
-                quantity = position.get('units', 0)
-                if quantity > 0:
-                    symbol_quantities[sym] = symbol_quantities.get(sym, 0) + quantity
-        
-        # Fetch daily prices for each symbol
-        for symbol, quantity in symbol_quantities.items():
-            try:
-                ticker = yf.Ticker(symbol)
-                hist = ticker.history(start=start_date, end=end_date, auto_adjust=True, interval='1d')
-                if hist is not None and len(hist) > 0:
-                    for date, row in hist.iterrows():
-                        date_str = date.strftime('%Y-%m-%d')
-                        price = float(row.get('Adj Close', row.get('Close', 0)))
-                        if date_str not in daily_values:
-                            daily_values[date_str] = 0
-                        daily_values[date_str] += price * quantity
-                    stock_data[symbol] = {
-                        'quantity': quantity,
-                        'prices': {date.strftime('%Y-%m-%d'): float(row.get('Adj Close', row.get('Close', 0))) 
-                                  for date, row in hist.iterrows()}
-                    }
-            except Exception as e:
-                print(f"Error fetching data for {symbol}: {e}")
-        
-        # Convert to sorted list
-        history = [{'date': date, 'value': value} for date, value in sorted(daily_values.items())]
-        
-        return jsonify({
-            'success': True,
-            'data': history,
-            'stockData': stock_data,
-            'symbols': list(symbol_quantities.keys())
-        })
-        
-    except Exception as e:
-        print(f"Error in get_daily_portfolio: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-
 def _get_symbol_from_position(position):
     """Extract symbol from position object"""
     sym = position.get('symbol')
     if isinstance(sym, dict):
-        # Handle nested symbol structure
         inner_symbol = sym.get('symbol')
         if isinstance(inner_symbol, dict):
-            # Sometimes symbol.symbol is also a dict
             return inner_symbol.get('symbol') or inner_symbol.get('raw_symbol') or 'N/A'
         return inner_symbol or sym.get('raw_symbol') or 'N/A'
     return str(sym) if sym else 'N/A'
@@ -788,7 +745,6 @@ def _mock_quote(symbol: str):
 
 
 def _normalize_symbol_for_yf(symbol: str) -> str:
-    # Yahoo uses '-' instead of '.' for some tickers like BRK.B
     return symbol.replace('.', '-')
 
 
@@ -803,7 +759,6 @@ def _fetch_quote_yf(symbol: str):
     prev_close = None
     name = None
     try:
-        # Prefer lightweight price via recent history to avoid blocked endpoints
         hist = yf.Ticker(yn).history(period='5d', interval='1d', auto_adjust=False)
         if hist is not None and len(hist.index) > 0 and 'Close' in hist:
             closes = hist['Close'].dropna()
@@ -813,7 +768,6 @@ def _fetch_quote_yf(symbol: str):
                 prev_close = float(closes.iloc[-2])
     except Exception:
         pass
-    # If still missing, attempt fast_info as a secondary source
     if price is None:
         try:
             fi = getattr(yf.Ticker(yn), 'fast_info', None) or {}
@@ -821,7 +775,6 @@ def _fetch_quote_yf(symbol: str):
             prev_close = prev_close if prev_close is not None else fi.get('previous_close')
         except Exception:
             pass
-    # Compute change percent or fallback
     change_pct = 0.0
     if price is None or (isinstance(price, float) and not price):
         data = _mock_quote(symbol)
@@ -841,11 +794,10 @@ def _fetch_quote_yf(symbol: str):
 
 
 def _batch_quotes_yf(symbols):
-    """Fetch quotes with per-symbol lightweight history method, using cache first."""
+    """Fetch quotes with per-symbol lightweight history method"""
     results = {}
     if not symbols:
         return results
-    # Cap to limit rate exposure
     symbols = list(dict.fromkeys(symbols))[:10]
     for sym in symbols:
         cached = _quote_from_cache(sym)
@@ -860,11 +812,9 @@ def _batch_quotes_yf(symbols):
         except Exception:
             results[sym] = _quote_from_cache(sym) or _mock_quote(sym)
     return results
-
-
 @app.route('/api/symbols/quote', methods=['GET'])
 def get_symbol_quote():
-    """Return a cached or live quote for a single symbol with graceful fallback"""
+    """Return a cached or live quote for a single symbol"""
     try:
         symbol = (request.args.get('symbol') or '').upper().strip()
         if not symbol:
@@ -874,11 +824,9 @@ def get_symbol_quote():
     except Exception as e:
         cached = _quote_from_cache(symbol) if 'symbol' in locals() else None
         return jsonify({'success': True, 'data': cached or _mock_quote(symbol if 'symbol' in locals() else 'SYM')})
-
-
 @app.route('/api/watchlist/quotes', methods=['GET'])
 def get_watchlist_quotes():
-    """Return batched quotes for watchlist or provided symbols (comma separated)."""
+    """Return batched quotes for watchlist"""
     try:
         symbols_param = request.args.get('symbols')
         symbols = []
@@ -886,7 +834,6 @@ def get_watchlist_quotes():
             symbols = [s.upper().strip() for s in symbols_param.split(',') if s.strip()]
         else:
             symbols = WATCHLIST[:]
-        # Try batch first
         batch_map = _batch_quotes_yf(symbols)
         quotes = []
         for sym in symbols:

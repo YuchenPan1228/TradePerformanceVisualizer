@@ -6,3 +6,4 @@ __pycache__/
 *.cache
 data-export/account-data.json
 backend/users.json
+backend/venv/

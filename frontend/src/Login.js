@@ -1,3 +1,4 @@
+// frontend/src/components/Login.jsx
 import React, { useState, useEffect } from 'react';
 import axios from 'axios';
 
@@ -7,15 +8,12 @@ const Login = ({ onLogin }) => {
   const [isLogin, setIsLogin] = useState(true);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
-  const [snaptradeClientId, setSnaptradeClientId] = useState('');
-  const [snaptradeConsumerKey, setSnaptradeConsumerKey] = useState('');
-  const [snaptradeUserId, setSnaptradeUserId] = useState('');
-  const [snaptradeUserSecret, setSnaptradeUserSecret] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [registrationStep, setRegistrationStep] = useState('initial'); // 'initial', 'connecting', 'completed'
+  const [connectionUrl, setConnectionUrl] = useState('');
 
   useEffect(() => {
-    // Check if already logged in
     checkAuthStatus();
   }, []);
 
@@ -51,42 +49,124 @@ const Login = ({ onLogin }) => {
           setError(data.error || 'Login failed');
         }
       } else {
-        // Register
-        if (!snaptradeClientId || !snaptradeConsumerKey || !snaptradeUserId || !snaptradeUserSecret) {
-          setError('All Snaptrade fields are required');
-          setLoading(false);
-          return;
-        }
+        // Register - Step 1: Create user and register with Snaptrade
         const { data } = await axios.post(
           `${API_URL}/auth/register`,
           {
             username,
             password,
-            snaptrade_client_id: snaptradeClientId,
-            snaptrade_consumer_key: snaptradeConsumerKey,
-            snaptrade_user_id: snaptradeUserId,
-            snaptrade_user_secret: snaptradeUserSecret
+            snaptrade_user_id: username
           },
           { withCredentials: true }
         );
+        
+        
         if (data.success) {
           setError('');
-          alert('Account created successfully! Please login.');
-          setIsLogin(true);
-          setSnaptradeClientId('');
-          setSnaptradeConsumerKey('');
-          setSnaptradeUserId('');
-          setSnaptradeUserSecret('');
+          setRegistrationStep('connecting');
+          setConnectionUrl(data.redirectURI);
+          
+          // Auto-open the connection URL in a new window
+          window.open(data.redirectURI, '_blank', 'width=800,height=600');
         } else {
           setError(data.error || 'Registration failed');
         }
       }
     } catch (err) {
-      setError(err.response?.data?.error || err.message || 'An error occurred');
+      if (err.code === 'ERR_NETWORK' || err.message === 'Network Error') {
+        setError('Cannot connect to server. Please make sure the backend server is running on port 5001.');
+      } else {
+        setError(err.response?.data?.error || err.message || 'An error occurred');
+      }
+      console.error('Login error:', err);
     } finally {
       setLoading(false);
     }
   };
+
+  const handleConnectionComplete = async () => {
+    setLoading(true);
+    try {
+      // Fetch and store account data
+      const { data } = await axios.post(
+        `${API_URL}/auth/complete-setup`,
+        { username },
+        { withCredentials: true }
+      );
+      
+      if (data.success) {
+        alert('Account setup completed successfully! Please login.');
+        setRegistrationStep('initial');
+        setIsLogin(true);
+        setConnectionUrl('');
+      } else {
+        setError(data.error || 'Failed to complete setup');
+      }
+    } catch (err) {
+      setError(err.response?.data?.error || 'Failed to complete setup');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  if (registrationStep === 'connecting') {
+    return (
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center py-12 px-4 sm:px-6 lg:px-8">
+        <div className="max-w-md w-full space-y-8">
+          <div>
+            <h2 className="mt-6 text-center text-3xl font-extrabold text-gray-900">
+              Connect Your Brokerage Account
+            </h2>
+            <p className="mt-2 text-center text-sm text-gray-600">
+              A window has been opened for you to connect your brokerage account.
+            </p>
+          </div>
+          
+          <div className="bg-white shadow sm:rounded-lg p-6 space-y-4">
+            <div className="text-center">
+              <p className="text-sm text-gray-700 mb-4">
+                Complete the authentication in the opened window, then click the button below.
+              </p>
+              
+              <a
+                href={connectionUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-blue-600 hover:text-blue-500 text-sm underline mb-4 inline-block"
+              >
+                Open connection window again
+              </a>
+            </div>
+            
+            {error && (
+              <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded text-sm">
+                {error}
+              </div>
+            )}
+            
+            <button
+              onClick={handleConnectionComplete}
+              disabled={loading}
+              className="w-full flex justify-center py-2 px-4 border border-transparent text-sm font-medium rounded-md text-white bg-green-600 hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500 disabled:opacity-50"
+            >
+              {loading ? 'Completing setup...' : 'I\'ve connected my account'}
+            </button>
+            
+            <button
+              onClick={() => {
+                setRegistrationStep('initial');
+                setConnectionUrl('');
+                setError('');
+              }}
+              className="w-full flex justify-center py-2 px-4 border border-gray-300 text-sm font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-gray-50 flex items-center justify-center py-12 px-4 sm:px-6 lg:px-8">
@@ -119,9 +199,10 @@ const Login = ({ onLogin }) => {
             )}
           </p>
         </div>
+        
         <form className="mt-8 space-y-6" onSubmit={handleSubmit}>
           {error && (
-            <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded">
+            <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded text-sm">
               {error}
             </div>
           )}
@@ -151,7 +232,7 @@ const Login = ({ onLogin }) => {
                 name="password"
                 type="password"
                 required
-                className="appearance-none rounded-none relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 rounded-b-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 focus:z-10 sm:text-sm"
+                className={`appearance-none rounded-none relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 ${isLogin ? 'rounded-b-md' : ''} focus:outline-none focus:ring-blue-500 focus:border-blue-500 focus:z-10 sm:text-sm`}
                 placeholder="Password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
@@ -160,70 +241,10 @@ const Login = ({ onLogin }) => {
           </div>
 
           {!isLogin && (
-            <div className="space-y-4 border-t border-gray-200 pt-4">
-              <p className="text-sm text-gray-600">
-                Enter your Snaptrade credentials (one-time setup):
+            <div className="bg-blue-50 border border-blue-200 rounded-md p-4">
+              <p className="text-xs text-blue-800">
+                <strong>Note:</strong> After creating your account, you'll be prompted to connect your brokerage account through Snaptrade.
               </p>
-              <div>
-                <label htmlFor="snaptrade_client_id" className="block text-sm font-medium text-gray-700 mb-1">
-                  Snaptrade Client ID
-                </label>
-                <input
-                  id="snaptrade_client_id"
-                  name="snaptrade_client_id"
-                  type="text"
-                  required={!isLogin}
-                  className="appearance-none relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
-                  placeholder="CORNELL-UNIVERSITY-RESEARCH-TEST-ICBSL"
-                  value={snaptradeClientId}
-                  onChange={(e) => setSnaptradeClientId(e.target.value)}
-                />
-              </div>
-              <div>
-                <label htmlFor="snaptrade_consumer_key" className="block text-sm font-medium text-gray-700 mb-1">
-                  Snaptrade Consumer Key
-                </label>
-                <input
-                  id="snaptrade_consumer_key"
-                  name="snaptrade_consumer_key"
-                  type="text"
-                  required={!isLogin}
-                  className="appearance-none relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
-                  placeholder="Your consumer key"
-                  value={snaptradeConsumerKey}
-                  onChange={(e) => setSnaptradeConsumerKey(e.target.value)}
-                />
-              </div>
-              <div>
-                <label htmlFor="snaptrade_user_id" className="block text-sm font-medium text-gray-700 mb-1">
-                  Snaptrade User ID
-                </label>
-                <input
-                  id="snaptrade_user_id"
-                  name="snaptrade_user_id"
-                  type="text"
-                  required={!isLogin}
-                  className="appearance-none relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
-                  placeholder="yuchen-user-1280"
-                  value={snaptradeUserId}
-                  onChange={(e) => setSnaptradeUserId(e.target.value)}
-                />
-              </div>
-              <div>
-                <label htmlFor="snaptrade_user_secret" className="block text-sm font-medium text-gray-700 mb-1">
-                  Snaptrade User Secret
-                </label>
-                <input
-                  id="snaptrade_user_secret"
-                  name="snaptrade_user_secret"
-                  type="text"
-                  required={!isLogin}
-                  className="appearance-none relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
-                  placeholder="Your user secret"
-                  value={snaptradeUserSecret}
-                  onChange={(e) => setSnaptradeUserSecret(e.target.value)}
-                />
-              </div>
             </div>
           )}
 
@@ -243,4 +264,3 @@ const Login = ({ onLogin }) => {
 };
 
 export default Login;
-

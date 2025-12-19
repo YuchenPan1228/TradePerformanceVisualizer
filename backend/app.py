@@ -284,10 +284,8 @@ def register():
         # Step 2: Generate login URL for brokerage connection
         try:
             login_response = snaptrade_client.authentication.login_snap_trade_user(
-                body={
-                    'userId': user_id,
-                    'userSecret': user_secret
-                }
+                user_id=user_id,
+                user_secret=user_secret
             )
             
             if not login_response.body:

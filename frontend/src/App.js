@@ -297,6 +297,106 @@ const PortfolioDashboard = () => {
     return benchmarkData.map(d => ({ ...d, value: d.value * scale }));
   };
 
+  // Calculate performance metrics
+  const calculatePerformanceMetrics = (portfolioSeries, benchmarkSeries) => {
+    if (!portfolioSeries || portfolioSeries.length < 2) {
+      return {
+        sharpeRatio: 0,
+        maxDrawdown: 0,
+        volatility: 0,
+        beta: 0,
+        alpha: 0,
+        winRate: 0
+      };
+    }
+
+    // Calculate daily returns
+    const portfolioReturns = [];
+    for (let i = 1; i < portfolioSeries.length; i++) {
+      const prev = portfolioSeries[i - 1].value;
+      const curr = portfolioSeries[i].value;
+      if (prev > 0) {
+        portfolioReturns.push((curr - prev) / prev);
+      }
+    }
+
+    const benchmarkReturns = [];
+    if (benchmarkSeries && benchmarkSeries.length > 1) {
+      for (let i = 1; i < benchmarkSeries.length; i++) {
+        const prev = benchmarkSeries[i - 1].value;
+        const curr = benchmarkSeries[i].value;
+        if (prev > 0) {
+          benchmarkReturns.push((curr - prev) / prev);
+        }
+      }
+    }
+
+    // 1. Sharpe Ratio (assuming risk-free rate of 0 for simplicity, annualized)
+    const avgReturn = portfolioReturns.reduce((a, b) => a + b, 0) / portfolioReturns.length;
+    const variance = portfolioReturns.reduce((sum, r) => sum + Math.pow(r - avgReturn, 2), 0) / portfolioReturns.length;
+    const stdDev = Math.sqrt(variance);
+    const sharpeRatio = stdDev > 0 ? (avgReturn / stdDev) * Math.sqrt(252) : 0; // Annualized
+
+    // 2. Max Drawdown
+    let maxDrawdown = 0;
+    let peak = portfolioSeries[0].value;
+    for (let i = 1; i < portfolioSeries.length; i++) {
+      const value = portfolioSeries[i].value;
+      if (value > peak) {
+        peak = value;
+      }
+      const drawdown = (peak - value) / peak;
+      if (drawdown > maxDrawdown) {
+        maxDrawdown = drawdown;
+      }
+    }
+
+    // 3. Volatility (annualized standard deviation)
+    const volatility = stdDev * Math.sqrt(252) * 100; // Convert to percentage
+
+    // 4. Beta (correlation with benchmark)
+    let beta = 0;
+    if (benchmarkReturns.length === portfolioReturns.length && benchmarkReturns.length > 1) {
+      const portfolioMean = avgReturn;
+      const benchmarkMean = benchmarkReturns.reduce((a, b) => a + b, 0) / benchmarkReturns.length;
+      
+      let covariance = 0;
+      let benchmarkVariance = 0;
+      for (let i = 0; i < portfolioReturns.length; i++) {
+        covariance += (portfolioReturns[i] - portfolioMean) * (benchmarkReturns[i] - benchmarkMean);
+        benchmarkVariance += Math.pow(benchmarkReturns[i] - benchmarkMean, 2);
+      }
+      covariance /= portfolioReturns.length;
+      benchmarkVariance /= benchmarkReturns.length;
+      
+      beta = benchmarkVariance > 0 ? covariance / benchmarkVariance : 0;
+    }
+
+    // 5. Alpha (excess return vs benchmark, annualized)
+    let alpha = 0;
+    if (benchmarkReturns.length === portfolioReturns.length && benchmarkReturns.length > 1) {
+      const portfolioTotalReturn = (portfolioSeries[portfolioSeries.length - 1].value - portfolioSeries[0].value) / portfolioSeries[0].value;
+      const benchmarkTotalReturn = (benchmarkSeries[benchmarkSeries.length - 1].value - benchmarkSeries[0].value) / benchmarkSeries[0].value;
+      const days = portfolioSeries.length;
+      const annualizedPortfolio = Math.pow(1 + portfolioTotalReturn, 252 / days) - 1;
+      const annualizedBenchmark = Math.pow(1 + benchmarkTotalReturn, 252 / days) - 1;
+      alpha = (annualizedPortfolio - annualizedBenchmark) * 100; // Convert to percentage
+    }
+
+    // 6. Win Rate (% of profitable periods)
+    const profitablePeriods = portfolioReturns.filter(r => r > 0).length;
+    const winRate = portfolioReturns.length > 0 ? (profitablePeriods / portfolioReturns.length) * 100 : 0;
+
+    return {
+      sharpeRatio: sharpeRatio || 0,
+      maxDrawdown: maxDrawdown * 100 || 0, // Convert to percentage
+      volatility: volatility || 0,
+      beta: beta || 0,
+      alpha: alpha || 0,
+      winRate: winRate || 0
+    };
+  };
+
   const PerformanceGraph = () => {
     const height = 400;
     const width = 800;
@@ -393,6 +493,21 @@ const PortfolioDashboard = () => {
     const firstPortfolio = portfolioSeries[0]?.value ?? 0;
     const lastPortfolio = portfolioSeries[portfolioSeries.length - 1]?.value ?? 0;
     const portfolioReturn = firstPortfolio ? ((lastPortfolio - firstPortfolio) / Math.abs(firstPortfolio)) * 100 : 0;
+    
+    // Calculate performance metrics using original dollar values
+    // Convert Date objects to proper format for metrics calculation
+    const originalPortfolioForMetrics = (growthData || []).map(p => ({
+      date: typeof p.date === 'string' ? new Date(p.date) : p.date,
+      value: p.value
+    }));
+    
+    const originalBenchmarkForMetrics = (benchmarkData || []).map(p => ({
+      date: typeof p.date === 'string' ? new Date(p.date) : p.date,
+      value: p.value
+    }));
+    
+    // Calculate performance metrics
+    const metrics = calculatePerformanceMetrics(originalPortfolioForMetrics, originalBenchmarkForMetrics);
     
     const formatYValue = (val) => {
       if (yAxisType === 'return') {
@@ -780,6 +895,78 @@ const PortfolioDashboard = () => {
             );
           })}
         </div>
+
+        {/* Performance Metrics Panel */}
+        <div className="mt-6 pt-6 border-t border-gray-200">
+          <h3 className="text-lg font-semibold text-gray-900 mb-4">Performance Metrics</h3>
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
+            {/* Sharpe Ratio */}
+            <div className="bg-gradient-to-br from-blue-50 to-blue-100 rounded-lg p-4 border border-blue-200">
+              <div className="text-xs text-blue-700 font-medium mb-1">Sharpe Ratio</div>
+              <div className="text-2xl font-bold text-blue-900">
+                {metrics.sharpeRatio.toFixed(2)}
+              </div>
+              <div className="text-xs text-blue-600 mt-1">
+                {metrics.sharpeRatio > 1 ? 'Excellent' : metrics.sharpeRatio > 0.5 ? 'Good' : metrics.sharpeRatio > 0 ? 'Fair' : 'Poor'}
+              </div>
+            </div>
+
+            {/* Max Drawdown */}
+            <div className="bg-gradient-to-br from-red-50 to-red-100 rounded-lg p-4 border border-red-200">
+              <div className="text-xs text-red-700 font-medium mb-1">Max Drawdown</div>
+              <div className="text-2xl font-bold text-red-900">
+                {metrics.maxDrawdown.toFixed(2)}%
+              </div>
+              <div className="text-xs text-red-600 mt-1">
+                {metrics.maxDrawdown < 10 ? 'Low Risk' : metrics.maxDrawdown < 20 ? 'Moderate' : 'High Risk'}
+              </div>
+            </div>
+
+            {/* Volatility */}
+            <div className="bg-gradient-to-br from-purple-50 to-purple-100 rounded-lg p-4 border border-purple-200">
+              <div className="text-xs text-purple-700 font-medium mb-1">Volatility</div>
+              <div className="text-2xl font-bold text-purple-900">
+                {metrics.volatility.toFixed(2)}%
+              </div>
+              <div className="text-xs text-purple-600 mt-1">
+                Annualized
+              </div>
+            </div>
+
+            {/* Beta */}
+            <div className="bg-gradient-to-br from-green-50 to-green-100 rounded-lg p-4 border border-green-200">
+              <div className="text-xs text-green-700 font-medium mb-1">Beta</div>
+              <div className="text-2xl font-bold text-green-900">
+                {metrics.beta.toFixed(2)}
+              </div>
+              <div className="text-xs text-green-600 mt-1">
+                {metrics.beta > 1 ? 'More Volatile' : metrics.beta < 1 ? 'Less Volatile' : 'Market Match'}
+              </div>
+            </div>
+
+            {/* Alpha */}
+            <div className="bg-gradient-to-br from-orange-50 to-orange-100 rounded-lg p-4 border border-orange-200">
+              <div className="text-xs text-orange-700 font-medium mb-1">Alpha</div>
+              <div className={`text-2xl font-bold ${metrics.alpha >= 0 ? 'text-orange-900' : 'text-orange-700'}`}>
+                {metrics.alpha >= 0 ? '+' : ''}{metrics.alpha.toFixed(2)}%
+              </div>
+              <div className="text-xs text-orange-600 mt-1">
+                {benchmark !== 'none' ? 'vs Benchmark' : 'N/A'}
+              </div>
+            </div>
+
+            {/* Win Rate */}
+            <div className="bg-gradient-to-br from-indigo-50 to-indigo-100 rounded-lg p-4 border border-indigo-200">
+              <div className="text-xs text-indigo-700 font-medium mb-1">Win Rate</div>
+              <div className="text-2xl font-bold text-indigo-900">
+                {metrics.winRate.toFixed(1)}%
+              </div>
+              <div className="text-xs text-indigo-600 mt-1">
+                Profitable Periods
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
     );
   };
@@ -895,34 +1082,61 @@ const PortfolioDashboard = () => {
               <h2 className="text-2xl font-bold text-gray-900 mb-6">Your Holdings</h2>
               {holdings.length > 0 ? (
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {holdings.map((holding, idx) => (
-                    <div key={idx} className="bg-gray-50 rounded-xl p-6">
-                      <div className="flex items-start justify-between mb-4">
-                        <div>
-                           <div className="font-bold text-gray-900 text-lg">{safeText(holding.symbol)}</div>
-                           <div className="text-sm text-gray-500">{safeText(holding.name)}</div>
-                          <div className="text-xs text-gray-400 mt-1">{holding.quantity} shares</div>
+                  {holdings.map((holding, idx) => {
+                    const gainLoss = holding.marketValue - holding.costBasis;
+                    const gainLossPercent = holding.costBasis > 0 ? (gainLoss / holding.costBasis) * 100 : 0;
+                    const avgPrice = holding.costBasis / holding.quantity || 0;
+                    return (
+                      <div key={idx} className="bg-gradient-to-br from-white to-gray-50 rounded-xl p-6 border border-gray-200 hover:shadow-lg transition-shadow">
+                        <div className="flex items-start justify-between mb-4">
+                          <div className="flex-1">
+                            <div className="flex items-center gap-2 mb-1">
+                              <div className="font-bold text-gray-900 text-xl">{safeText(holding.symbol)}</div>
+                              <div className={`px-2 py-0.5 rounded text-xs font-medium ${holding.change > 0 ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
+                                {holding.change > 0 ? '+' : ''}{holding.change.toFixed(2)}%
+                              </div>
+                            </div>
+                            <div className="text-sm text-gray-600 mb-2">{safeText(holding.name)}</div>
+                            <div className="text-xs text-gray-500">{holding.quantity.toLocaleString()} shares</div>
+                          </div>
+                          <div className="text-right ml-4">
+                            <div className="font-bold text-gray-900 text-lg">${holding.price.toFixed(2)}</div>
+                            <div className={`text-sm flex items-center gap-1 justify-end mt-1 ${holding.change > 0 ? 'text-green-600' : 'text-red-600'}`}>
+                              <span>{holding.change > 0 ? '↑' : '↓'}</span>
+                              {Math.abs(holding.change).toFixed(2)}%
+                            </div>
+                          </div>
                         </div>
-                        <div className="text-right">
-                          <div className="font-bold text-gray-900">${holding.price.toFixed(2)}</div>
-                          <div className={`text-sm flex items-center gap-1 justify-end ${holding.change > 0 ? 'text-green-600' : 'text-red-600'}`}>
-                            <span>{holding.change > 0 ? '↑' : '↓'}</span>
-                            {Math.abs(holding.change).toFixed(2)}%
+                        <div className="border-t border-gray-200 pt-4 mt-4 space-y-2">
+                          <div className="grid grid-cols-2 gap-4">
+                            <div>
+                              <div className="text-xs text-gray-500 mb-1">Market Value</div>
+                              <div className="font-semibold text-gray-900">${holding.marketValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+                            </div>
+                            <div>
+                              <div className="text-xs text-gray-500 mb-1">Cost Basis</div>
+                              <div className="font-semibold text-gray-900">${holding.costBasis.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+                            </div>
+                          </div>
+                          <div className="grid grid-cols-2 gap-4 pt-2 border-t border-gray-100">
+                            <div>
+                              <div className="text-xs text-gray-500 mb-1">Avg Price</div>
+                              <div className="font-medium text-gray-700">${avgPrice.toFixed(2)}</div>
+                            </div>
+                            <div>
+                              <div className="text-xs text-gray-500 mb-1">Gain/Loss</div>
+                              <div className={`font-semibold ${gainLoss >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                                {gainLoss >= 0 ? '+' : ''}${gainLoss.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                              </div>
+                              <div className={`text-xs ${gainLossPercent >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                                ({gainLossPercent >= 0 ? '+' : ''}{gainLossPercent.toFixed(2)}%)
+                              </div>
+                            </div>
                           </div>
                         </div>
                       </div>
-                      <div className="border-t border-gray-200 pt-3 mt-3">
-                        <div className="flex justify-between text-sm">
-                          <span className="text-gray-600">Market Value:</span>
-                          <span className="font-medium">${holding.marketValue.toFixed(2)}</span>
-                        </div>
-                        <div className="flex justify-between text-sm mt-1">
-                          <span className="text-gray-600">Cost Basis:</span>
-                          <span className="font-medium">${holding.costBasis.toFixed(2)}</span>
-                        </div>
-                      </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               ) : (
                 <div className="text-center py-12 text-gray-500">No holdings found in your portfolio</div>
@@ -949,37 +1163,46 @@ const PortfolioDashboard = () => {
                     <thead>
                       <tr className="text-left text-sm text-gray-500 border-b">
                         <th className="pb-3 font-medium">Description</th>
-                        <th className="pb-3 font-medium">Date</th>
+                        <th className="pb-3 font-medium">Date & Time</th>
                         <th className="pb-3 font-medium">Amount</th>
                         <th className="pb-3 font-medium">Type</th>
-                        <th className="pb-3 font-medium">Status</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {transactions.map((tx, idx) => (
-                        <tr key={idx} className="border-b last:border-0">
-                          <td className="py-4">
-                            <div className="font-medium">{safeText(tx.description) || safeText(tx.symbol) || 'N/A'}</div>
-                            {tx.quantity && (
-                              <div className="text-sm text-gray-500">
-                                {tx.quantity} shares @ ${tx.price}
+                      {transactions.map((tx, idx) => {
+                        const txDate = tx.date ? new Date(tx.date) : new Date();
+                        const dateStr = txDate.toLocaleDateString('en-US', { 
+                          month: 'short', 
+                          day: 'numeric', 
+                          year: 'numeric' 
+                        });
+                        const timeStr = txDate.toLocaleTimeString('en-US', { 
+                          hour: '2-digit', 
+                          minute: '2-digit',
+                          hour12: true
+                        });
+                        return (
+                          <tr key={idx} className="border-b last:border-0 hover:bg-gray-50 transition-colors">
+                            <td className="py-4">
+                              <div className="font-medium text-gray-900">{safeText(tx.description) || safeText(tx.symbol) || 'N/A'}</div>
+                            </td>
+                            <td className="py-4">
+                              <div className="text-gray-900 text-sm font-medium">{dateStr}</div>
+                              <div className="text-gray-500 text-xs">{timeStr}</div>
+                            </td>
+                            <td className="py-4">
+                              <div className={`font-semibold ${tx.amount >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                                {tx.amount >= 0 ? '+' : ''}${Math.abs(tx.amount).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                               </div>
-                            )}
-                          </td>
-                          <td className="py-4 text-gray-600 text-sm">
-                            {new Date(tx.date).toLocaleDateString()}
-                          </td>
-                          <td className="py-4 font-medium">
-                            ${Math.abs(tx.amount).toLocaleString(undefined, { minimumFractionDigits: 2 })}
-                          </td>
-                          <td className="py-4 text-gray-600">{safeText(tx.type)}</td>
-                          <td className="py-4">
-                            <span className="px-3 py-1 rounded-full text-sm font-medium bg-green-100 text-green-700">
-                              {tx.status}
-                            </span>
-                          </td>
-                        </tr>
-                      ))}
+                            </td>
+                            <td className="py-4">
+                              <span className="px-2 py-1 rounded text-xs font-medium bg-blue-100 text-blue-700">
+                                {safeText(tx.type)}
+                              </span>
+                            </td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>

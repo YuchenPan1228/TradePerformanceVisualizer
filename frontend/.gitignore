@@ -1,0 +1,15 @@
+
+# dependencies & build caches
+node_modules/
+frontend/node_modules/
+**/.cache/
+*.pack
+*.pack.old
+.eslintcache
+
+# dependencies
+node_modules/
+
+# caches
+**/.cache/
+

@@ -497,6 +497,115 @@ def get_accounts():
             'error': str(e)
         }), 500
 
+def _format_transaction_type(activity):
+    """Format transaction type for better display"""
+    activity_type = activity.get('type', '').upper()
+    
+    # Handle specific type codes from Snaptrade/Alpaca
+    if activity_type == 'JNLC':
+        return 'DEPOSIT'
+    if activity_type == 'JNLS':
+        return 'WITHDRAWAL'
+    if activity_type in ('FEE', 'FEES'):
+        return 'FEE'
+    if activity_type in ('DIV', 'DIVIDEND'):
+        return 'DIVIDEND'
+    if activity_type in ('INT', 'INTEREST'):
+        return 'INTEREST'
+    if activity_type in ('BUY', 'SELL'):
+        return activity_type
+    
+    # Default to original type
+    return activity_type if activity_type else 'OTHER'
+
+def _format_transaction_description(activity, formatted_type):
+    """Format transaction description for better readability"""
+    description = activity.get('description', '').strip()
+    amount = activity.get('amount', 0)
+    symbol = activity.get('symbol', '')
+    
+    # Normalize symbol - remove "N/A"
+    if symbol == 'N/A':
+        symbol = ''
+    
+    # Format based on type
+    if formatted_type == 'DEPOSIT':
+        if description:
+            return description
+        return f'Deposit of ${abs(amount):,.2f}'
+    
+    if formatted_type == 'WITHDRAWAL':
+        if description:
+            return description
+        return f'Withdrawal of ${abs(amount):,.2f}'
+    
+    if formatted_type == 'FEE':
+        if description:
+            return description
+        return f'Trading fee: ${abs(amount):,.2f}'
+    
+    if formatted_type in ('DIVIDEND', 'INTEREST'):
+        if description:
+            return description
+        if symbol:
+            return f'{formatted_type.title()} from {symbol}'
+        return f'{formatted_type.title()} payment'
+    
+    # For trades (BUY/SELL), the description from the API is already well-formatted
+    if description:
+        return description
+    
+    # Fallback if no description
+    if symbol:
+        return f'{symbol} {formatted_type}'
+    
+    return f'{formatted_type} transaction'
+
+def _parse_transaction_description(description, symbol):
+    """Parse transaction description to separate action type from details"""
+    if not description:
+        return 'Transaction', description
+    
+    # Common patterns in descriptions
+    desc_upper = description.upper()
+    
+    # Check for BUY variations
+    if 'BUY PARTIAL_FILL' in desc_upper:
+        action = 'BUY PARTIAL_FILL'
+    elif 'BUY FILL' in desc_upper:
+        action = 'BUY FILL'
+    elif 'BUY' in desc_upper:
+        action = 'BUY'
+    # Check for SELL variations
+    elif 'SELL PARTIAL_FILL' in desc_upper:
+        action = 'SELL PARTIAL_FILL'
+    elif 'SELL FILL' in desc_upper:
+        action = 'SELL FILL'
+    elif 'SELL' in desc_upper:
+        action = 'SELL'
+    # Check for other types
+    elif 'DEPOSIT' in desc_upper or 'JNLC' in desc_upper:
+        action = 'DEPOSIT'
+    elif 'WITHDRAWAL' in desc_upper or 'JNLS' in desc_upper:
+        action = 'WITHDRAWAL'
+    elif 'FEE' in desc_upper:
+        action = 'FEE'
+    elif 'DIVIDEND' in desc_upper or 'DIV' in desc_upper:
+        action = 'DIVIDEND'
+    elif 'INTEREST' in desc_upper or 'INT' in desc_upper:
+        action = 'INTEREST'
+    else:
+        action = 'Transaction'
+    
+    # Extract price if present (e.g., "at 612.17")
+    price_match = None
+    import re
+    price_pattern = r'at\s+([\d,.]+)'
+    match = re.search(price_pattern, description, re.IGNORECASE)
+    if match:
+        price_match = match.group(1)
+    
+    return action, price_match
 
 @app.route('/api/transactions', methods=['GET'])
 def get_transactions():
@@ -516,27 +625,40 @@ def get_transactions():
         transactions = []
         body = getattr(activities_response, 'body', None) or []
         if body:
-            for activity in body[:10]:
+            for activity in body:
                 raw_symbol = activity.get('symbol')
                 if isinstance(raw_symbol, dict):
                     norm_symbol = raw_symbol.get('symbol') or raw_symbol.get('raw_symbol') or 'N/A'
                 else:
                     norm_symbol = raw_symbol or 'N/A'
+                
+                description = activity.get('description', '')
+                action, price_from_desc = _parse_transaction_description(description, norm_symbol)
+                
                 transactions.append({
                     'id': activity.get('id'),
                     'symbol': norm_symbol,
                     'type': activity.get('type', 'Unknown'),
-                    'description': activity.get('description', ''),
+                    'action': action,  # NEW: Separated action type
+                    'description': description,
+                    'priceFromDescription': price_from_desc,  # NEW: Extracted price
                     'date': activity.get('trade_date', activity.get('settlement_date', '')),
                     'amount': activity.get('amount', 0),
                     'quantity': activity.get('quantity', 0),
                     'price': activity.get('price', 0),
                     'status': 'Success'
                 })
-
+        
+        # Sort transactions by date (descending), then by time (descending), then by symbol (ascending)
+        transactions.sort(key=lambda x: (
+            -datetime.fromisoformat(x['date'].replace('Z', '+00:00')).timestamp() if x['date'] else 0,
+            x['symbol']
+        ))
+        
+        # Return only the first 10 transactions
         return jsonify({
             'success': True,
-            'data': transactions
+            'data': transactions[:10]
         })
     except Exception as e:
         print(f"Error getting transactions: {e}")
@@ -544,7 +666,6 @@ def get_transactions():
             'success': True,
             'data': []
         })
-
 
 @app.route('/api/portfolio/stocks', methods=['GET'])
 def get_portfolio_stocks():

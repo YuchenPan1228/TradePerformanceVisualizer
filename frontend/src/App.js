@@ -18,16 +18,22 @@ const PortfolioDashboard = () => {
   const [watchlistQuotes, setWatchlistQuotes] = useState([]);
   const [watchlistIndex, setWatchlistIndex] = useState(0);
   
+  // Transaction filters
+  const [symbolFilter, setSymbolFilter] = useState('all');
+  const [typeFilter, setTypeFilter] = useState('all');
+  const [dateFilter, setDateFilter] = useState('all');
+  const [customDateRange, setCustomDateRange] = useState({ start: '', end: '' });
+  
   // Performance graph controls
-  const [yAxisType, setYAxisType] = useState('dollar'); // 'dollar' or 'return'
-  const [benchmark, setBenchmark] = useState('none'); // 'none', 'SPY', 'custom'
-  const [portfolioFilter, setPortfolioFilter] = useState('whole'); // 'whole' or 'risk'
+  const [yAxisType, setYAxisType] = useState('dollar');
+  const [benchmark, setBenchmark] = useState('none');
+  const [portfolioFilter, setPortfolioFilter] = useState('whole');
   const [benchmarkData, setBenchmarkData] = useState([]);
-  const [timeframe, setTimeframe] = useState(30); // days
+  const [timeframe, setTimeframe] = useState(30);
   const [availableStocks, setAvailableStocks] = useState([]);
-  const [selectedStocks, setSelectedStocks] = useState(new Set()); // Set of selected stock symbols
+  const [selectedStocks, setSelectedStocks] = useState(new Set());
   const [showStockFilter, setShowStockFilter] = useState(false);
-  const [hoveredPoint, setHoveredPoint] = useState(null); // {x, y, date, portfolioValue, benchmarkValue}
+  const [hoveredPoint, setHoveredPoint] = useState(null);
 
   useEffect(() => {
     checkAuthStatus();
@@ -80,7 +86,6 @@ const PortfolioDashboard = () => {
       });
       if (data.success) {
         setAvailableStocks(data.data || []);
-        // Select all stocks by default
         setSelectedStocks(new Set(data.data.map(s => s.symbol)));
       }
     } catch (err) {
@@ -111,13 +116,12 @@ const PortfolioDashboard = () => {
       const { data } = await axios.get(`${API_URL}/portfolio/history`, {
         params: { 
           days: timeframe,
-          daily: 'true', // Use daily reconstruction
+          daily: 'true',
           ...(symbols && { symbols })
         },
         withCredentials: true
       });
       if (data.success && data.data) {
-        // Transform the data to match the chart format
         const series = data.data.map(item => ({
           date: new Date(item.date),
           value: Number(item.value) || 0
@@ -159,7 +163,6 @@ const PortfolioDashboard = () => {
     } else {
       setBenchmarkData([]);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [timeframe, benchmark, selectedStocks]);
 
   const fetchTransactions = async () => {
@@ -220,6 +223,72 @@ const PortfolioDashboard = () => {
     return String(val);
   };
 
+  // Filter transactions
+  const getFilteredTransactions = () => {
+    let filtered = [...transactions];
+    
+    if (symbolFilter !== 'all') {
+      filtered = filtered.filter(tx => tx.symbol === symbolFilter);
+    }
+    
+    if (typeFilter !== 'all') {
+      if (typeFilter === 'buy') {
+        filtered = filtered.filter(tx => tx.type === 'BUY');
+      } else if (typeFilter === 'sell') {
+        filtered = filtered.filter(tx => tx.type === 'SELL');
+      } else if (typeFilter === 'fees') {
+        filtered = filtered.filter(tx => tx.type === 'FEE');
+      } else if (typeFilter === 'deposits') {
+        filtered = filtered.filter(tx => tx.type === 'JNLC' || tx.action?.toLowerCase().includes('deposit'));
+      } else if (typeFilter === 'fill') {
+        filtered = filtered.filter(tx => tx.action?.includes('FILL') && !tx.action?.includes('PARTIAL'));
+      } else if (typeFilter === 'partial') {
+        filtered = filtered.filter(tx => tx.action?.includes('PARTIAL_FILL'));
+      }
+    }
+    
+    if (dateFilter !== 'all') {
+      const now = new Date();
+      const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      
+      filtered = filtered.filter(tx => {
+        const txDate = tx.date ? new Date(tx.date) : new Date();
+        
+        if (dateFilter === 'today') {
+          return txDate >= today;
+        } else if (dateFilter === 'week') {
+          const weekAgo = new Date(today);
+          weekAgo.setDate(weekAgo.getDate() - 7);
+          return txDate >= weekAgo;
+        } else if (dateFilter === 'month') {
+          const monthAgo = new Date(today);
+          monthAgo.setMonth(monthAgo.getMonth() - 1);
+          return txDate >= monthAgo;
+        } else if (dateFilter === 'custom') {
+          if (customDateRange.start && customDateRange.end) {
+            const startDate = new Date(customDateRange.start);
+            const endDate = new Date(customDateRange.end);
+            endDate.setHours(23, 59, 59, 999);
+            return txDate >= startDate && txDate <= endDate;
+          }
+        }
+        return true;
+      });
+    }
+    
+    return filtered;
+  };
+
+  const getUniqueSymbols = () => {
+    const symbols = new Set();
+    transactions.forEach(tx => {
+      if (tx.symbol && tx.symbol !== 'N/A') {
+        symbols.add(tx.symbol);
+      }
+    });
+    return Array.from(symbols).sort();
+  };
+
   if (checkingAuth) {
     return (
       <div className="min-h-screen bg-gray-50 flex items-center justify-center">
@@ -276,7 +345,6 @@ const PortfolioDashboard = () => {
     ? holdings.reduce((min, h) => (h.change < min.change ? h : min), holdings[0])
     : null;
 
-  // Calculate returns from dollar values
   const calculateReturns = (data) => {
     if (!data || data.length === 0) return [];
     const firstValue = data[0].value;
@@ -287,7 +355,6 @@ const PortfolioDashboard = () => {
     }));
   };
 
-  // Normalize benchmark data to start at same point as portfolio for comparison
   const normalizeBenchmark = (portfolioData, benchmarkData) => {
     if (!portfolioData || portfolioData.length === 0 || !benchmarkData || benchmarkData.length === 0) return benchmarkData;
     const portfolioFirst = portfolioData[0].value;
@@ -297,7 +364,6 @@ const PortfolioDashboard = () => {
     return benchmarkData.map(d => ({ ...d, value: d.value * scale }));
   };
 
-  // Calculate performance metrics
   const calculatePerformanceMetrics = (portfolioSeries, benchmarkSeries) => {
     if (!portfolioSeries || portfolioSeries.length < 2) {
       return {
@@ -310,7 +376,6 @@ const PortfolioDashboard = () => {
       };
     }
 
-    // Calculate daily returns
     const portfolioReturns = [];
     for (let i = 1; i < portfolioSeries.length; i++) {
       const prev = portfolioSeries[i - 1].value;
@@ -331,13 +396,11 @@ const PortfolioDashboard = () => {
       }
     }
 
-    // 1. Sharpe Ratio (assuming risk-free rate of 0 for simplicity, annualized)
     const avgReturn = portfolioReturns.reduce((a, b) => a + b, 0) / portfolioReturns.length;
     const variance = portfolioReturns.reduce((sum, r) => sum + Math.pow(r - avgReturn, 2), 0) / portfolioReturns.length;
     const stdDev = Math.sqrt(variance);
-    const sharpeRatio = stdDev > 0 ? (avgReturn / stdDev) * Math.sqrt(252) : 0; // Annualized
+    const sharpeRatio = stdDev > 0 ? (avgReturn / stdDev) * Math.sqrt(252) : 0;
 
-    // 2. Max Drawdown
     let maxDrawdown = 0;
     let peak = portfolioSeries[0].value;
     for (let i = 1; i < portfolioSeries.length; i++) {
@@ -351,10 +414,8 @@ const PortfolioDashboard = () => {
       }
     }
 
-    // 3. Volatility (annualized standard deviation)
-    const volatility = stdDev * Math.sqrt(252) * 100; // Convert to percentage
+    const volatility = stdDev * Math.sqrt(252) * 100;
 
-    // 4. Beta (correlation with benchmark)
     let beta = 0;
     if (benchmarkReturns.length === portfolioReturns.length && benchmarkReturns.length > 1) {
       const portfolioMean = avgReturn;
@@ -372,7 +433,6 @@ const PortfolioDashboard = () => {
       beta = benchmarkVariance > 0 ? covariance / benchmarkVariance : 0;
     }
 
-    // 5. Alpha (excess return vs benchmark, annualized)
     let alpha = 0;
     if (benchmarkReturns.length === portfolioReturns.length && benchmarkReturns.length > 1) {
       const portfolioTotalReturn = (portfolioSeries[portfolioSeries.length - 1].value - portfolioSeries[0].value) / portfolioSeries[0].value;
@@ -380,16 +440,15 @@ const PortfolioDashboard = () => {
       const days = portfolioSeries.length;
       const annualizedPortfolio = Math.pow(1 + portfolioTotalReturn, 252 / days) - 1;
       const annualizedBenchmark = Math.pow(1 + benchmarkTotalReturn, 252 / days) - 1;
-      alpha = (annualizedPortfolio - annualizedBenchmark) * 100; // Convert to percentage
+      alpha = (annualizedPortfolio - annualizedBenchmark) * 100;
     }
 
-    // 6. Win Rate (% of profitable periods)
     const profitablePeriods = portfolioReturns.filter(r => r > 0).length;
     const winRate = portfolioReturns.length > 0 ? (profitablePeriods / portfolioReturns.length) * 100 : 0;
 
     return {
       sharpeRatio: sharpeRatio || 0,
-      maxDrawdown: maxDrawdown * 100 || 0, // Convert to percentage
+      maxDrawdown: maxDrawdown * 100 || 0,
       volatility: volatility || 0,
       beta: beta || 0,
       alpha: alpha || 0,
@@ -402,24 +461,20 @@ const PortfolioDashboard = () => {
     const width = 800;
     const padding = 60;
     
-    // Prepare portfolio data
     let portfolioPoints = growthData || [];
     if (yAxisType === 'return') {
       portfolioPoints = calculateReturns(portfolioPoints);
     }
     
-    // Prepare benchmark data
     let benchmarkPoints = benchmarkData || [];
     if (benchmarkPoints.length > 0) {
       if (yAxisType === 'return') {
         benchmarkPoints = calculateReturns(benchmarkPoints);
       } else {
-        // Normalize benchmark to portfolio scale for dollar comparison
         benchmarkPoints = normalizeBenchmark(portfolioPoints, benchmarkPoints);
       }
     }
     
-    // Combine and sort all dates
     const allDates = [...new Set([
       ...portfolioPoints.map(p => p.date.getTime()),
       ...benchmarkPoints.map(p => p.date.getTime())
@@ -433,13 +488,11 @@ const PortfolioDashboard = () => {
       );
     }
     
-    // Interpolate values for missing dates
     const getValueAtDate = (data, date) => {
       const sorted = [...data].sort((a, b) => a.date - b.date);
       for (let i = 0; i < sorted.length; i++) {
         if (sorted[i].date.getTime() >= date) {
           if (i === 0) return sorted[0].value;
-          // Linear interpolation
           const prev = sorted[i - 1];
           const curr = sorted[i];
           const ratio = (date - prev.date.getTime()) / (curr.date.getTime() - prev.date.getTime());
@@ -459,7 +512,6 @@ const PortfolioDashboard = () => {
       value: getValueAtDate(benchmarkPoints, date)
     })) : [];
     
-    // Calculate Y-axis range
     const allValues = [
       ...portfolioSeries.map(p => p.value),
       ...benchmarkSeries.map(p => p.value)
@@ -494,8 +546,6 @@ const PortfolioDashboard = () => {
     const lastPortfolio = portfolioSeries[portfolioSeries.length - 1]?.value ?? 0;
     const portfolioReturn = firstPortfolio ? ((lastPortfolio - firstPortfolio) / Math.abs(firstPortfolio)) * 100 : 0;
     
-    // Calculate performance metrics using original dollar values
-    // Convert Date objects to proper format for metrics calculation
     const originalPortfolioForMetrics = (growthData || []).map(p => ({
       date: typeof p.date === 'string' ? new Date(p.date) : p.date,
       value: p.value
@@ -506,7 +556,6 @@ const PortfolioDashboard = () => {
       value: p.value
     }));
     
-    // Calculate performance metrics
     const metrics = calculatePerformanceMetrics(originalPortfolioForMetrics, originalBenchmarkForMetrics);
     
     const formatYValue = (val) => {
@@ -518,7 +567,6 @@ const PortfolioDashboard = () => {
     
     return (
       <div className="bg-white rounded-2xl p-6 shadow-sm">
-        {/* Header with stock name and value */}
         <div className="mb-6">
           <h2 className="text-2xl font-bold text-gray-900 mb-2">Portfolio Performance</h2>
           <div className="text-3xl font-bold text-gray-900 mb-1">
@@ -537,7 +585,6 @@ const PortfolioDashboard = () => {
         
         <div className="border-t border-gray-200 pt-4 mb-4"></div>
         
-        {/* Controls */}
         <div className="mb-6 space-y-4">
           <div className="flex flex-wrap gap-4 items-center">
             <div className="flex items-center gap-2">
@@ -585,7 +632,6 @@ const PortfolioDashboard = () => {
             </button>
           </div>
           
-          {/* Stock Selection Checkboxes */}
           {showStockFilter && (
             <div className="bg-gray-50 rounded-lg p-4 border border-gray-200">
               <div className="flex items-center justify-between mb-3">
@@ -633,7 +679,6 @@ const PortfolioDashboard = () => {
           )}
         </div>
         
-        {/* Graph */}
         <div className="bg-gray-50 rounded-lg p-4 relative">
           <svg 
             viewBox={`0 0 ${width} ${height}`} 
@@ -646,13 +691,8 @@ const PortfolioDashboard = () => {
                 <stop offset="0%" stopColor="#3b82f6" stopOpacity="0.25" />
                 <stop offset="100%" stopColor="#3b82f6" stopOpacity="0" />
               </linearGradient>
-              <linearGradient id="benchmarkGrad" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="#10b981" stopOpacity="0.25" />
-                <stop offset="100%" stopColor="#10b981" stopOpacity="0" />
-              </linearGradient>
             </defs>
             
-            {/* Grid lines */}
             <g stroke="#e5e7eb" strokeWidth="1" strokeDasharray="2,2">
               {[0, 0.25, 0.5, 0.75, 1].map(t => (
                 <line
@@ -665,7 +705,6 @@ const PortfolioDashboard = () => {
               ))}
             </g>
             
-            {/* Portfolio area */}
             {portfolioPath && (
               <>
                 <path
@@ -681,7 +720,6 @@ const PortfolioDashboard = () => {
               </>
             )}
             
-            {/* Benchmark line */}
             {benchmarkPath && (
               <path
                 d={benchmarkPath}
@@ -692,7 +730,6 @@ const PortfolioDashboard = () => {
               />
             )}
             
-            {/* Interactive hover areas and points */}
             {portfolioSeries.map((point, i) => {
               const x = sx(i);
               const y = sy(point.value);
@@ -700,7 +737,6 @@ const PortfolioDashboard = () => {
               
               return (
                 <g key={i}>
-                  {/* Invisible hover area */}
                   <rect
                     x={x - 10}
                     y={padding}
@@ -723,7 +759,6 @@ const PortfolioDashboard = () => {
                       });
                     }}
                   />
-                  {/* Visible point on hover */}
                   {hoveredPoint && Math.abs(hoveredPoint.x - x) < 15 && (
                     <>
                       <circle
@@ -744,7 +779,6 @@ const PortfolioDashboard = () => {
                           strokeWidth={2}
                         />
                       )}
-                      {/* Vertical line */}
                       <line
                         x1={x}
                         y1={padding}
@@ -760,7 +794,6 @@ const PortfolioDashboard = () => {
               );
             })}
             
-            {/* Y-axis labels */}
             <g className="text-xs fill-gray-600">
               {[0, 0.25, 0.5, 0.75, 1].map(t => {
                 const val = y0 + (y1 - y0) * (1 - t);
@@ -777,7 +810,6 @@ const PortfolioDashboard = () => {
               })}
             </g>
             
-            {/* X-axis date labels */}
             <g className="text-xs fill-gray-600">
               {(() => {
                 const numLabels = Math.min(8, portfolioSeries.length);
@@ -803,13 +835,11 @@ const PortfolioDashboard = () => {
                     );
                   }
                 }
-                // Always show last date
                 if (portfolioSeries.length > 0) {
                   const lastPoint = portfolioSeries[portfolioSeries.length - 1];
                   const lastX = sx(portfolioSeries.length - 1);
                   const lastDateStr = lastPoint.date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
                   
-                  // Only add if not already added
                   if (labels.length === 0 || labels[labels.length - 1].key !== String(portfolioSeries.length - 1)) {
                     labels.push(
                       <text
@@ -829,7 +859,6 @@ const PortfolioDashboard = () => {
             </g>
           </svg>
           
-          {/* Hover Tooltip */}
           {hoveredPoint && (
             <div
               className="absolute bg-gray-900 text-white px-3 py-2 rounded-lg shadow-lg text-sm pointer-events-none z-10"
@@ -862,7 +891,6 @@ const PortfolioDashboard = () => {
           )}
         </div>
         
-        {/* Legend */}
         <div className="flex items-center gap-6 mt-4 pt-4 border-t border-gray-200">
           <div className="flex items-center gap-2">
             <div className="w-4 h-0.5 bg-blue-600"></div>
@@ -876,7 +904,6 @@ const PortfolioDashboard = () => {
           )}
         </div>
         
-        {/* Timeframe buttons */}
         <div className="flex gap-2 mt-6 pt-4 border-t border-gray-200">
           {[1, 5, 30, 90, 180, 365].map(days => {
             const labels = { 1: '1D', 5: '5D', 30: '1M', 90: '3M', 180: '6M', 365: '1Y' };
@@ -896,11 +923,9 @@ const PortfolioDashboard = () => {
           })}
         </div>
 
-        {/* Performance Metrics Panel */}
         <div className="mt-6 pt-6 border-t border-gray-200">
           <h3 className="text-lg font-semibold text-gray-900 mb-4">Performance Metrics</h3>
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
-            {/* Sharpe Ratio */}
             <div className="bg-gradient-to-br from-blue-50 to-blue-100 rounded-lg p-4 border border-blue-200">
               <div className="text-xs text-blue-700 font-medium mb-1">Sharpe Ratio</div>
               <div className="text-2xl font-bold text-blue-900">
@@ -911,7 +936,6 @@ const PortfolioDashboard = () => {
               </div>
             </div>
 
-            {/* Max Drawdown */}
             <div className="bg-gradient-to-br from-red-50 to-red-100 rounded-lg p-4 border border-red-200">
               <div className="text-xs text-red-700 font-medium mb-1">Max Drawdown</div>
               <div className="text-2xl font-bold text-red-900">
@@ -922,7 +946,6 @@ const PortfolioDashboard = () => {
               </div>
             </div>
 
-            {/* Volatility */}
             <div className="bg-gradient-to-br from-purple-50 to-purple-100 rounded-lg p-4 border border-purple-200">
               <div className="text-xs text-purple-700 font-medium mb-1">Volatility</div>
               <div className="text-2xl font-bold text-purple-900">
@@ -933,7 +956,6 @@ const PortfolioDashboard = () => {
               </div>
             </div>
 
-            {/* Beta */}
             <div className="bg-gradient-to-br from-green-50 to-green-100 rounded-lg p-4 border border-green-200">
               <div className="text-xs text-green-700 font-medium mb-1">Beta</div>
               <div className="text-2xl font-bold text-green-900">
@@ -944,7 +966,6 @@ const PortfolioDashboard = () => {
               </div>
             </div>
 
-            {/* Alpha */}
             <div className="bg-gradient-to-br from-orange-50 to-orange-100 rounded-lg p-4 border border-orange-200">
               <div className="text-xs text-orange-700 font-medium mb-1">Alpha</div>
               <div className={`text-2xl font-bold ${metrics.alpha >= 0 ? 'text-orange-900' : 'text-orange-700'}`}>
@@ -955,7 +976,6 @@ const PortfolioDashboard = () => {
               </div>
             </div>
 
-            {/* Win Rate */}
             <div className="bg-gradient-to-br from-indigo-50 to-indigo-100 rounded-lg p-4 border border-indigo-200">
               <div className="text-xs text-indigo-700 font-medium mb-1">Win Rate</div>
               <div className="text-2xl font-bold text-indigo-900">
@@ -973,7 +993,6 @@ const PortfolioDashboard = () => {
 
   return (
     <div className="min-h-screen bg-gray-50">
-      {/* Header */}
       <header className="bg-white border-b border-gray-200 px-6 py-4">
         <div className="flex items-center justify-between max-w-7xl mx-auto">
           <div className="flex items-center gap-4">
@@ -1016,7 +1035,6 @@ const PortfolioDashboard = () => {
       </header>
 
       <main className="max-w-7xl mx-auto px-6 py-8">
-        {/* Watchlist Ticker */}
         {watchlistQuotes.length > 0 && (
           <section className="bg-white rounded-xl shadow-sm mb-6 overflow-hidden">
             <div className="flex items-center justify-between px-4 pt-3">
@@ -1051,7 +1069,7 @@ const PortfolioDashboard = () => {
             </div>
           </section>
         )}
-        {/* Portfolio Summary */}
+
         <section className="bg-gradient-to-r from-blue-600 to-blue-800 rounded-2xl p-8 text-white mb-6">
           <h1 className="text-2xl font-bold mb-4">Portfolio Overview</h1>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
@@ -1073,11 +1091,9 @@ const PortfolioDashboard = () => {
         </section>
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Left: Holdings + Transactions */}
           <div className="lg:col-span-2 space-y-6">
-            {/* Performance Graph */}
             <PerformanceGraph />
-            {/* Holdings */}
+            
             <section className="bg-white rounded-2xl p-6 shadow-sm">
               <h2 className="text-2xl font-bold text-gray-900 mb-6">Your Holdings</h2>
               {holdings.length > 0 ? (
@@ -1143,78 +1159,199 @@ const PortfolioDashboard = () => {
               )}
             </section>
 
-            {/* Transactions */}
             <section className="bg-white rounded-2xl p-6 shadow-sm">
               <div className="flex items-center justify-between mb-6">
                 <h2 className="text-2xl font-bold text-gray-900">Recent Transactions</h2>
-                <div className="relative">
-                  <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-gray-400" />
-                  <input
-                    type="text"
-                    placeholder="Search..."
-                    className="pl-10 pr-4 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  />
-                </div>
               </div>
 
-              {transactions.length > 0 ? (
-                <div className="overflow-x-auto">
-                  <table className="w-full">
-                    <thead>
-                      <tr className="text-left text-sm text-gray-500 border-b">
-                        <th className="pb-3 font-medium">Description</th>
-                        <th className="pb-3 font-medium">Date & Time</th>
-                        <th className="pb-3 font-medium">Amount</th>
-                        <th className="pb-3 font-medium">Type</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {transactions.map((tx, idx) => {
-                        const txDate = tx.date ? new Date(tx.date) : new Date();
-                        const dateStr = txDate.toLocaleDateString('en-US', { 
-                          month: 'short', 
-                          day: 'numeric', 
-                          year: 'numeric' 
-                        });
-                        const timeStr = txDate.toLocaleTimeString('en-US', { 
-                          hour: '2-digit', 
-                          minute: '2-digit',
-                          hour12: true
-                        });
-                        return (
-                          <tr key={idx} className="border-b last:border-0 hover:bg-gray-50 transition-colors">
-                            <td className="py-4">
-                              <div className="font-medium text-gray-900">{safeText(tx.description) || safeText(tx.symbol) || 'N/A'}</div>
-                            </td>
-                            <td className="py-4">
-                              <div className="text-gray-900 text-sm font-medium">{dateStr}</div>
-                              <div className="text-gray-500 text-xs">{timeStr}</div>
-                            </td>
-                            <td className="py-4">
-                              <div className={`font-semibold ${tx.amount >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                                {tx.amount >= 0 ? '+' : ''}${Math.abs(tx.amount).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                              </div>
-                            </td>
-                            <td className="py-4">
-                              <span className="px-2 py-1 rounded text-xs font-medium bg-blue-100 text-blue-700">
-                                {safeText(tx.type)}
-                              </span>
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
+              <div className="mb-6 space-y-4">
+                <div className="flex flex-wrap gap-4">
+                  <div className="flex-1 min-w-[200px]">
+                    <label className="block text-sm font-medium text-gray-700 mb-2">Symbol</label>
+                    <select
+                      value={symbolFilter}
+                      onChange={(e) => setSymbolFilter(e.target.value)}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    >
+                      <option value="all">All Symbols</option>
+                      {getUniqueSymbols().map(symbol => (
+                        <option key={symbol} value={symbol}>{symbol}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="flex-1 min-w-[200px]">
+                    <label className="block text-sm font-medium text-gray-700 mb-2">Type</label>
+                    <select
+                      value={typeFilter}
+                      onChange={(e) => setTypeFilter(e.target.value)}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    >
+                      <option value="all">All Types</option>
+                      <option value="buy">Buy Orders</option>
+                      <option value="sell">Sell Orders</option>
+                      <option value="fill">Fills</option>
+                      <option value="partial">Partial Fills</option>
+                      <option value="fees">Fees Only</option>
+                      <option value="deposits">Deposits/Withdrawals</option>
+                    </select>
+                  </div>
+
+                  <div className="flex-1 min-w-[200px]">
+                    <label className="block text-sm font-medium text-gray-700 mb-2">Date Range</label>
+                    <select
+                      value={dateFilter}
+                      onChange={(e) => setDateFilter(e.target.value)}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    >
+                      <option value="all">All Time</option>
+                      <option value="today">Today</option>
+                      <option value="week">Last 7 Days</option>
+                      <option value="month">Last 30 Days</option>
+                      <option value="custom">Custom Range</option>
+                    </select>
+                  </div>
                 </div>
-              ) : (
-                <div className="text-center py-12 text-gray-500">No recent transactions</div>
-              )}
+
+                {dateFilter === 'custom' && (
+                  <div className="flex gap-4 items-end">
+                    <div className="flex-1">
+                      <label className="block text-sm font-medium text-gray-700 mb-2">Start Date</label>
+                      <input
+                        type="date"
+                        value={customDateRange.start}
+                        onChange={(e) => setCustomDateRange({ ...customDateRange, start: e.target.value })}
+                        className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      />
+                    </div>
+                    <div className="flex-1">
+                      <label className="block text-sm font-medium text-gray-700 mb-2">End Date</label>
+                      <input
+                        type="date"
+                        value={customDateRange.end}
+                        onChange={(e) => setCustomDateRange({ ...customDateRange, end: e.target.value })}
+                        className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {(symbolFilter !== 'all' || typeFilter !== 'all' || dateFilter !== 'all') && (
+                  <div className="flex items-center justify-between pt-2 border-t border-gray-200">
+                    <div className="flex items-center gap-2 text-sm text-gray-600">
+                      <span>Active filters:</span>
+                      {symbolFilter !== 'all' && (
+                        <span className="px-2 py-1 bg-blue-100 text-blue-700 rounded-md">Symbol: {symbolFilter}</span>
+                      )}
+                      {typeFilter !== 'all' && (
+                        <span className="px-2 py-1 bg-blue-100 text-blue-700 rounded-md">Type: {typeFilter}</span>
+                      )}
+                      {dateFilter !== 'all' && (
+                        <span className="px-2 py-1 bg-blue-100 text-blue-700 rounded-md">
+                          Date: {dateFilter === 'custom' ? 'Custom' : dateFilter}
+                        </span>
+                      )}
+                    </div>
+                    <button
+                      onClick={() => {
+                        setSymbolFilter('all');
+                        setTypeFilter('all');
+                        setDateFilter('all');
+                        setCustomDateRange({ start: '', end: '' });
+                      }}
+                      className="text-sm text-blue-600 hover:text-blue-800 font-medium"
+                    >
+                      Clear All Filters
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {(() => {
+                const filteredTransactions = getFilteredTransactions();
+                
+                return filteredTransactions.length > 0 ? (
+                  <div className="overflow-x-auto">
+                    <table className="w-full">
+                      <thead>
+                        <tr className="text-left text-sm text-gray-500 border-b">
+                          <th className="pb-3 font-medium">Symbol</th>
+                          <th className="pb-3 font-medium">Action</th>
+                          <th className="pb-3 font-medium">Date & Time</th>
+                          <th className="pb-3 font-medium text-right">Amount</th>
+                          <th className="pb-3 font-medium text-center">Type</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {filteredTransactions.map((tx, idx) => {
+                          const txDate = tx.date ? new Date(tx.date) : new Date();
+                          const dateStr = txDate.toLocaleDateString('en-US', { 
+                            month: 'short', 
+                            day: 'numeric', 
+                            year: 'numeric' 
+                          });
+                          const timeStr = txDate.toLocaleTimeString('en-US', { 
+                            hour: '2-digit', 
+                            minute: '2-digit',
+                            hour12: true
+                          });
+                          
+                          const displaySymbol = tx.symbol && tx.symbol !== 'N/A' ? tx.symbol : '—';
+                          
+                          return (
+                            <tr key={idx} className="border-b last:border-0 hover:bg-gray-50 transition-colors">
+                              <td className="py-4">
+                                <div className="font-bold text-gray-900">{displaySymbol}</div>
+                              </td>
+                              <td className="py-4">
+                                <div className="font-medium text-gray-900">{tx.action || tx.type}</div>
+                                {tx.priceFromDescription && (
+                                  <div className="text-xs text-gray-500">at ${tx.priceFromDescription}</div>
+                                )}
+                              </td>
+                              <td className="py-4">
+                                <div className="text-gray-900 text-sm font-medium">{dateStr}</div>
+                                <div className="text-gray-500 text-xs">{timeStr}</div>
+                              </td>
+                              <td className="py-4 text-right">
+                                <div className={`font-semibold ${tx.amount >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                                  {tx.amount >= 0 ? '+' : ''}${Math.abs(tx.amount).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                </div>
+                              </td>
+                              <td className="py-4 text-center">
+                                <span className={`inline-block px-2 py-1 rounded text-xs font-medium ${
+                                  tx.type === 'BUY' ? 'bg-blue-100 text-blue-700' :
+                                  tx.type === 'SELL' ? 'bg-orange-100 text-orange-700' :
+                                  tx.type === 'FEE' ? 'bg-gray-100 text-gray-700' :
+                                  tx.type === 'JNLC' ? 'bg-green-100 text-green-700' :
+                                  'bg-gray-100 text-gray-700'
+                                }`}>
+                                  {tx.type === 'JNLC' ? 'DEPOSIT' : safeText(tx.type)}
+                                </span>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                    <div className="mt-4 text-sm text-gray-500 text-center">
+                      Showing {filteredTransactions.length} of {transactions.length} transactions
+                    </div>
+                  </div>
+                ) : (
+                  <div className="text-center py-12">
+                    <div className="text-gray-400 mb-2">
+                      <Search className="w-12 h-12 mx-auto mb-3" />
+                    </div>
+                    <p className="text-gray-500 font-medium">No transactions match your filters</p>
+                    <p className="text-gray-400 text-sm mt-1">Try adjusting your filter criteria</p>
+                  </div>
+                );
+              })()}
             </section>
           </div>
 
-          {/* Sidebar */}
           <aside className="space-y-6">
-            {/* Top Holdings */}
             <section className="bg-white rounded-2xl p-6 shadow-sm">
               <h3 className="text-xl font-bold text-gray-900 mb-4">Top Holdings</h3>
               {holdings.slice(0, 5).map((holding, idx) => (
@@ -1233,7 +1370,6 @@ const PortfolioDashboard = () => {
               ))}
             </section>
 
-            {/* Quick Stats */}
             <section className="bg-white rounded-2xl p-6 shadow-sm">
               <h3 className="text-xl font-bold text-gray-900 mb-4">Quick Stats</h3>
               <div className="space-y-3">

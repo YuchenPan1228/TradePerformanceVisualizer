@@ -3,7 +3,7 @@ import { Search, Menu, Bell, Moon, LogOut } from 'lucide-react';
 import axios from 'axios';
 import Login from './Login';
 
-const API_URL = "/api";
+const API_URL = 'http://localhost:5001/api';
 
 const PortfolioDashboard = () => {
   const [isAuthenticated, setIsAuthenticated] = useState(false);

@@ -9,7 +9,32 @@ A full-stack application for visualizing trade performance with a Flask backend 
 
 ## Running the Application
 
-### Backend (Flask API)
+### Quick Start (Recommended - Auto-starts both backend and frontend)
+
+1. Navigate to the frontend directory:
+   ```bash
+   cd frontend
+   ```
+
+2. Install dependencies (if not already installed):
+   ```bash
+   npm install
+   ```
+
+3. Start both backend and frontend servers:
+   ```bash
+   npm run dev
+   ```
+
+   This will:
+   - Start the Flask backend server on `http://localhost:5001`
+   - Wait for the backend to be ready
+   - Start the React frontend on `http://localhost:3000`
+   - Automatically open the frontend in your browser
+
+### Running Services Separately
+
+#### Backend (Flask API)
 
 1. Navigate to the backend directory:
    ```bash
@@ -33,11 +58,11 @@ A full-stack application for visualizing trade performance with a Flask backend 
    python app.py
    ```
 
-   The backend will run on `http://localhost:5000`
+   The backend will run on `http://localhost:5001`
 
-### Frontend (React)
+#### Frontend (React)
 
-1. Open a new terminal window and navigate to the frontend directory:
+1. Navigate to the frontend directory:
    ```bash
    cd frontend
    ```
@@ -54,9 +79,9 @@ A full-stack application for visualizing trade performance with a Flask backend 
 
    The frontend will run on `http://localhost:3000` and automatically open in your browser.
 
-## Quick Start (Both Services)
+### Manual Start (Both Services in Separate Terminals)
 
-To run both services simultaneously, open two terminal windows:
+If you prefer to run both services in separate terminal windows:
 
 **Terminal 1 - Backend:**
 ```bash

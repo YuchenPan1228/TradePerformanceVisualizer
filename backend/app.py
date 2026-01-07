@@ -14,8 +14,8 @@ app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
 CORS(app, supports_credentials=True, origins=['http://localhost:3000', 'http://localhost:3001', 'http://127.0.0.1:3000', 'http://127.0.0.1:3001'])
 
 # Configuration
-SNAPTRADE_CLIENT_ID = "CORNELL-UNIVERSITY-RESEARCH-TEST-ICBSL"
-SNAPTRADE_CONSUMER_KEY = "bKh7Iq0NKEu0sdmEZEdzhbKsucQXffLLomqJTBEjQPCasweaJA"
+SNAPTRADE_CLIENT_ID = "BFI-TEST-ZKMWM"
+SNAPTRADE_CONSUMER_KEY = "1Xatzk3JKI3DP2dXneri6y8ehYmfhuHvyofbQVmLCTkb2eMKsk"
 
 # Database files
 USERS_DB_FILE = 'users.json'

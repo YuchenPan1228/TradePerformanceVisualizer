@@ -1279,6 +1279,7 @@ const PortfolioDashboard = () => {
                           <th className="pb-3 font-medium">Action</th>
                           <th className="pb-3 font-medium">Date & Time</th>
                           <th className="pb-3 font-medium text-right">Amount</th>
+                          <th className="pb-3 font-medium text-right">Shares</th>
                           <th className="pb-3 font-medium text-center">Type</th>
                         </tr>
                       </thead>
@@ -1297,6 +1298,11 @@ const PortfolioDashboard = () => {
                           });
                           
                           const displaySymbol = tx.symbol && tx.symbol !== 'N/A' ? tx.symbol : '—';
+                          
+                          // Calculate shares for buy fill/partial fill transactions
+                          const isBuyFill = tx.action && (tx.action.includes('BUY FILL') || tx.action.includes('BUY PARTIAL_FILL'));
+                          const price = tx.priceFromDescription ? parseFloat(String(tx.priceFromDescription).replace(/,/g, '')) : (tx.price || 0);
+                          const shares = isBuyFill && price > 0 && tx.amount ? (Math.abs(tx.amount) / price) : null;
                           
                           return (
                             <tr key={idx} className="border-b last:border-0 hover:bg-gray-50 transition-colors">
@@ -1317,6 +1323,15 @@ const PortfolioDashboard = () => {
                                 <div className={`font-semibold ${tx.amount >= 0 ? 'text-green-600' : 'text-red-600'}`}>
                                   {tx.amount >= 0 ? '+' : ''}${Math.abs(tx.amount).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                                 </div>
+                              </td>
+                              <td className="py-4 text-right">
+                                {shares !== null ? (
+                                  <div className="font-medium text-gray-900">
+                                    {shares.toLocaleString(undefined, { maximumFractionDigits: 4 })}
+                                  </div>
+                                ) : (
+                                  <div className="text-gray-400">—</div>
+                                )}
                               </td>
                               <td className="py-4 text-center">
                                 <span className={`inline-block px-2 py-1 rounded text-xs font-medium ${

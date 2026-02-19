@@ -3,7 +3,8 @@ import { Search, Menu, Bell, Moon, LogOut } from 'lucide-react';
 import axios from 'axios';
 import Login from './Login';
 
-const API_URL = '/api';
+// const API_URL = 'http://18.221.160.103:5001/api';
+const API_URL = 'http://bfi.duckdns.org:5001/api';
 
 const PortfolioDashboard = () => {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -812,43 +813,46 @@ const PortfolioDashboard = () => {
             
             <g className="text-xs fill-gray-600">
               {(() => {
-                const numLabels = Math.min(8, portfolioSeries.length);
-                const step = Math.max(1, Math.floor(portfolioSeries.length / numLabels));
-                const labels = [];
+                if (portfolioSeries.length === 0) return [];
                 
-                for (let i = 0; i < portfolioSeries.length; i += step) {
-                  if (i === portfolioSeries.length - 1 || labels.length < numLabels - 1) {
-                    const point = portfolioSeries[i];
-                    const x = sx(i);
-                    const date = point.date;
-                    const dateStr = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+                const numLabels = Math.min(8, portfolioSeries.length);
+                const firstDate = portfolioSeries[0].date.getTime();
+                const lastDate = portfolioSeries[portfolioSeries.length - 1].date.getTime();
+                const dateRange = lastDate - firstDate;
+                
+                const labels = [];
+                const labelIndices = new Set();
+                
+                // Generate evenly spaced target dates
+                for (let i = 0; i < numLabels; i++) {
+                  const targetTime = firstDate + (dateRange * i / (numLabels - 1));
+                  
+                  // Find the closest data point to this target time
+                  let closestIdx = 0;
+                  let minDiff = Math.abs(portfolioSeries[0].date.getTime() - targetTime);
+                  
+                  for (let j = 1; j < portfolioSeries.length; j++) {
+                    const diff = Math.abs(portfolioSeries[j].date.getTime() - targetTime);
+                    if (diff < minDiff) {
+                      minDiff = diff;
+                      closestIdx = j;
+                    }
+                  }
+                  
+                  if (!labelIndices.has(closestIdx)) {
+                    labelIndices.add(closestIdx);
+                    const point = portfolioSeries[closestIdx];
+                    const x = sx(closestIdx);
+                    const dateStr = point.date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
                     
                     labels.push(
                       <text
-                        key={i}
+                        key={closestIdx}
                         x={x}
                         y={height - padding + 20}
                         textAnchor="middle"
                       >
                         {dateStr}
-                      </text>
-                    );
-                  }
-                }
-                if (portfolioSeries.length > 0) {
-                  const lastPoint = portfolioSeries[portfolioSeries.length - 1];
-                  const lastX = sx(portfolioSeries.length - 1);
-                  const lastDateStr = lastPoint.date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-                  
-                  if (labels.length === 0 || labels[labels.length - 1].key !== String(portfolioSeries.length - 1)) {
-                    labels.push(
-                      <text
-                        key={portfolioSeries.length - 1}
-                        x={lastX}
-                        y={height - padding + 20}
-                        textAnchor="middle"
-                      >
-                        {lastDateStr}
                       </text>
                     );
                   }

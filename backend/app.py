@@ -11,11 +11,11 @@ import secrets
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
-CORS(app, supports_credentials=True, origins=['http://localhost:3000', 'http://localhost:3001', 'http://127.0.0.1:3000', 'http://127.0.0.1:3001'])
+CORS(app, supports_credentials=True, origins=['http://localhost:3000', 'http://localhost:3001', 'http://127.0.0.1:3000', 'http://127.0.0.1:3001', 'http://18.221.160.103:5001', 'http://18.221.160.103:3000', 'http://bfi.duckdns.org'])
 
 # Configuration
-SNAPTRADE_CLIENT_ID = "BFI-TEST-ZKMWM"
-SNAPTRADE_CONSUMER_KEY = "1Xatzk3JKI3DP2dXneri6y8ehYmfhuHvyofbQVmLCTkb2eMKsk"
+SNAPTRADE_CLIENT_ID = "BFI-DFTUD"
+SNAPTRADE_CONSUMER_KEY = "UflJTFaCJXSpEEmoGaEjtotESLszJnvFlXrglda7xlWRbAgb6y"
 
 # Database files
 USERS_DB_FILE = 'users.json'
@@ -182,6 +182,11 @@ def get_positions():
             'success': False,
             'error': str(e)
         }), 500
+
+@app.route('/api/portfolio', methods=['GET'])
+def portfolio_redirect():
+    """Redirect /api/portfolio to /api/portfolio/summary"""
+    return get_portfolio_summary()
 
 
 @app.route('/api/portfolio/summary', methods=['GET'])
@@ -1108,6 +1113,6 @@ def export_account_data():
 
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5001)
+    app.run(host='0.0.0.0', port=5001)
 
 

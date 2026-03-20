@@ -8,6 +8,7 @@ import yfinance as yf
 import logging
 import hashlib
 import secrets
+import re
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
@@ -599,13 +600,97 @@ def _parse_transaction_description(description, symbol):
     
     # Extract price if present (e.g., "at 612.17")
     price_match = None
-    import re
     price_pattern = r'at\s+([\d,.]+)'
     match = re.search(price_pattern, description, re.IGNORECASE)
     if match:
         price_match = match.group(1)
     
     return action, price_match
+
+def _to_float(value, default=0.0):
+    try:
+        if value is None or value == '':
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+def _normalize_option_metadata(activity):
+    option_symbol = activity.get('option_symbol')
+    if not isinstance(option_symbol, dict):
+        return {
+            'isOption': False,
+            'underlyingSymbol': None,
+            'strikePrice': None,
+            'optionType': None,
+            'expirationDate': None,
+            'contractCount': 0.0,
+            'positionSide': None
+        }
+
+    units = _to_float(activity.get('units', activity.get('quantity', 0)), 0.0)
+    underlying = option_symbol.get('underlying_symbol')
+    underlying_symbol = None
+    if isinstance(underlying, dict):
+        underlying_symbol = underlying.get('symbol') or underlying.get('raw_symbol')
+
+    option_type = (option_symbol.get('option_type') or '').upper()
+    if option_type not in ('CALL', 'PUT'):
+        option_type = None
+
+    position_side = None
+    if units > 0:
+        position_side = 'LONG'
+    elif units < 0:
+        position_side = 'SHORT'
+
+    return {
+        'isOption': True,
+        'underlyingSymbol': underlying_symbol,
+        'strikePrice': _to_float(option_symbol.get('strike_price'), None),
+        'optionType': option_type,
+        'expirationDate': option_symbol.get('expiration_date'),
+        'contractCount': abs(units),
+        'positionSide': position_side
+    }
+
+def _normalize_type_label(raw_type, action, is_option):
+    type_upper = (raw_type or '').upper()
+    action_upper = (action or '').upper()
+
+    if type_upper == 'JNLC':
+        return 'DEPOSIT'
+    if type_upper == 'JNLS':
+        return 'WITHDRAWAL'
+    if type_upper in ('FEE', 'FEES'):
+        return 'FEE'
+    if type_upper in ('DIV', 'DIVIDEND'):
+        return 'DIVIDEND'
+    if type_upper in ('INT', 'INTEREST'):
+        return 'INTEREST'
+
+    if is_option:
+        if 'EXERCISE' in type_upper or 'EXERCISE' in action_upper:
+            return 'EXERCISE'
+        if 'ASSIGN' in type_upper or 'ASSIGN' in action_upper:
+            return 'ASSIGNMENT'
+        if 'OPEN' in action_upper:
+            return 'OPEN'
+        if 'CLOSE' in action_upper:
+            return 'CLOSE'
+
+    return type_upper if type_upper else 'OTHER'
+
+def _parse_iso_dt(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+    except Exception:
+        return None
+
+def _option_key(option_type, strike_price, expiration_date, underlying_symbol):
+    return f"{underlying_symbol or ''}|{option_type or ''}|{strike_price or ''}|{expiration_date or ''}"
 
 @app.route('/api/transactions', methods=['GET'])
 def get_transactions():
@@ -617,15 +702,15 @@ def get_transactions():
         
         snaptrade_client = get_snaptrade_client()
         
+        transactions = []
         activities_response = snaptrade_client.transactions_and_reporting.get_activities(
             user_id=user_id,
             user_secret=user_secret
         )
-
-        transactions = []
-        body = getattr(activities_response, 'body', None) or []
-        if body:
-            for activity in body:
+        activities_body = getattr(activities_response, 'body', None) or []
+        option_activity_candidates = []
+        if activities_body:
+            for activity in activities_body:
                 raw_symbol = activity.get('symbol')
                 if isinstance(raw_symbol, dict):
                     norm_symbol = raw_symbol.get('symbol') or raw_symbol.get('raw_symbol') or 'N/A'
@@ -634,20 +719,162 @@ def get_transactions():
                 
                 description = activity.get('description', '')
                 action, price_from_desc = _parse_transaction_description(description, norm_symbol)
+                option_meta = _normalize_option_metadata(activity)
+                amount = _to_float(activity.get('amount', 0), 0.0)
+                fee = _to_float(activity.get('fee', 0), 0.0)
+                units = _to_float(activity.get('units', activity.get('quantity', 0)), 0.0)
+                price = _to_float(activity.get('price', 0), 0.0)
+                type_label = _normalize_type_label(activity.get('type', 'Unknown'), action, option_meta['isOption'])
                 
                 transactions.append({
                     'id': activity.get('id'),
                     'symbol': norm_symbol,
                     'type': activity.get('type', 'Unknown'),
-                    'action': action,  # NEW: Separated action type
+                    'typeLabel': type_label,
+                    'action': action,
                     'description': description,
-                    'priceFromDescription': price_from_desc,  # NEW: Extracted price
+                    'priceFromDescription': price_from_desc,
                     'date': activity.get('trade_date', activity.get('settlement_date', '')),
-                    'amount': activity.get('amount', 0),
-                    'quantity': activity.get('quantity', 0),
-                    'price': activity.get('price', 0),
+                    'tradeDate': activity.get('trade_date'),
+                    'settlementDate': activity.get('settlement_date'),
+                    'amount': amount,
+                    'fee': fee,
+                    'netAmount': amount - fee,
+                    'quantity': units,
+                    'units': units,
+                    'price': price,
+                    'isOption': option_meta['isOption'],
+                    'underlyingSymbol': option_meta['underlyingSymbol'],
+                    'strikePrice': option_meta['strikePrice'],
+                    'optionType': option_meta['optionType'],
+                    'expirationDate': option_meta['expirationDate'],
+                    'contractCount': option_meta['contractCount'],
+                    'positionSide': option_meta['positionSide'],
+                    'limitPrice': None,
+                    'executionPrice': price,
+                    'placedTime': activity.get('trade_date'),
+                    'executedTime': activity.get('trade_date'),
+                    'feeBreakdown': {
+                        'occClearingFee': 0.0,
+                        'orfFee': 0.0,
+                        'otherFees': fee
+                    },
+                    'source': 'activity',
                     'status': 'Success'
                 })
+                if option_meta['isOption']:
+                    option_activity_candidates.append({
+                        'key': _option_key(
+                            option_meta['optionType'],
+                            option_meta['strikePrice'],
+                            option_meta['expirationDate'],
+                            option_meta['underlyingSymbol']
+                        ),
+                        'side': 'BUY' if amount < 0 else 'SELL',
+                        'units': abs(units),
+                        'price': price,
+                        'fee': fee,
+                        'dt': _parse_iso_dt(activity.get('trade_date') or activity.get('settlement_date'))
+                    })
+
+        # Include all option orders so options view can show open/pending/executed flow.
+        account_id = get_account_id()
+        if account_id:
+            try:
+                orders_response = snaptrade_client.account_information.get_user_account_orders(
+                    user_id=user_id,
+                    user_secret=user_secret,
+                    account_id=account_id
+                )
+                orders_body = getattr(orders_response, 'body', None) or []
+                for order in orders_body:
+                    option_symbol = order.get('option_symbol')
+                    if not isinstance(option_symbol, dict):
+                        continue
+
+                    underlying = option_symbol.get('underlying_symbol')
+                    underlying_symbol = None
+                    if isinstance(underlying, dict):
+                        underlying_symbol = underlying.get('symbol') or underlying.get('raw_symbol')
+
+                    option_type = (option_symbol.get('option_type') or '').upper()
+                    if option_type not in ('CALL', 'PUT'):
+                        option_type = None
+
+                    filled_qty = _to_float(order.get('filled_quantity', order.get('total_quantity', 0)), 0.0)
+                    total_qty = _to_float(order.get('total_quantity', filled_qty), filled_qty)
+                    action = (order.get('action') or '').upper()
+                    position_side = 'LONG' if 'BUY' in action else ('SHORT' if 'SELL' in action else None)
+                    side = 'BUY' if 'BUY' in action else ('SELL' if 'SELL' in action else None)
+
+                    limit_price = _to_float(order.get('limit_price'), 0.0)
+                    execution_price = _to_float(order.get('execution_price'), 0.0)
+                    status_value = order.get('status') or 'UNKNOWN'
+                    placed_time = order.get('time_placed')
+                    executed_time = order.get('time_executed')
+                    order_dt = _parse_iso_dt(executed_time or placed_time)
+                    key = _option_key(option_type, _to_float(option_symbol.get('strike_price'), None), option_symbol.get('expiration_date'), underlying_symbol)
+                    qty_for_display = filled_qty if filled_qty > 0 else total_qty
+                    matched_fee = 0.0
+                    best_delta = None
+                    for candidate in option_activity_candidates:
+                        if candidate['key'] != key or candidate['side'] != side:
+                            continue
+                        if qty_for_display > 0 and candidate['units'] > 0 and abs(candidate['units'] - qty_for_display) > 0.0001:
+                            continue
+                        if execution_price > 0 and candidate['price'] > 0 and abs(candidate['price'] - execution_price) > 0.02:
+                            continue
+                        if order_dt and candidate['dt']:
+                            delta = abs((candidate['dt'] - order_dt).total_seconds())
+                        else:
+                            delta = 0
+                        if best_delta is None or delta < best_delta:
+                            best_delta = delta
+                            matched_fee = candidate['fee']
+                    order_amount = execution_price * filled_qty * 100
+                    if 'BUY' in action:
+                        order_amount = -abs(order_amount)
+                    elif 'SELL' in action:
+                        order_amount = abs(order_amount)
+
+                    transactions.append({
+                        'id': f"order_{order.get('brokerage_order_id')}",
+                        'symbol': underlying_symbol or 'N/A',
+                        'type': 'OPTION_ORDER',
+                        'typeLabel': _normalize_type_label('OPTION_ORDER', action, True),
+                        'action': action or 'ORDER',
+                        'description': f"Order {status_value}",
+                        'priceFromDescription': None,
+                        'date': executed_time or placed_time or '',
+                        'tradeDate': executed_time,
+                        'settlementDate': None,
+                        'amount': order_amount,
+                        'fee': matched_fee,
+                        'netAmount': order_amount - matched_fee,
+                        'quantity': qty_for_display,
+                        'units': qty_for_display,
+                        'price': execution_price,
+                        'isOption': True,
+                        'underlyingSymbol': underlying_symbol,
+                        'strikePrice': _to_float(option_symbol.get('strike_price'), None),
+                        'optionType': option_type,
+                        'expirationDate': option_symbol.get('expiration_date'),
+                        'contractCount': qty_for_display,
+                        'positionSide': position_side,
+                        'limitPrice': limit_price,
+                        'executionPrice': execution_price,
+                        'placedTime': placed_time,
+                        'executedTime': executed_time,
+                        'feeBreakdown': {
+                            'occClearingFee': 0.0,
+                            'orfFee': 0.0,
+                            'otherFees': matched_fee
+                        },
+                        'status': status_value,
+                        'source': 'order'
+                    })
+            except Exception as order_err:
+                print(f"Error getting option orders: {order_err}")
         
         # Sort transactions by date (descending), then by time (descending), then by symbol (ascending)
         transactions.sort(key=lambda x: (

@@ -183,11 +183,6 @@ def get_positions():
             'error': str(e)
         }), 500
 
-@app.route('/api/portfolio', methods=['GET'])
-def portfolio_redirect():
-    """Redirect /api/portfolio to /api/portfolio/summary"""
-    return get_portfolio_summary()
-
 
 @app.route('/api/portfolio/summary', methods=['GET'])
 def get_portfolio_summary():
@@ -663,7 +658,7 @@ def get_transactions():
         # Return only the first 10 transactions
         return jsonify({
             'success': True,
-            'data': transactions[:10]
+            'data': transactions
         })
     except Exception as e:
         print(f"Error getting transactions: {e}")
@@ -1113,6 +1108,6 @@ def export_account_data():
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5001)
+    app.run(debug=True, port=5001)
 
 

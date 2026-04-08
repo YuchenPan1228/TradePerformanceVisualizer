@@ -9,6 +9,7 @@ import logging
 import hashlib
 import secrets
 import re
+import glob
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
@@ -692,6 +693,86 @@ def _parse_iso_dt(value):
 def _option_key(option_type, strike_price, expiration_date, underlying_symbol):
     return f"{underlying_symbol or ''}|{option_type or ''}|{strike_price or ''}|{expiration_date or ''}"
 
+def _load_option_orders_from_latest_export():
+    """Fallback: load option orders from latest full-export JSON file."""
+    try:
+        export_files = sorted(
+            glob.glob(os.path.join('data-export', 'snaptrade_full_export_*.json')),
+            key=os.path.getmtime,
+            reverse=True
+        )
+        if not export_files:
+            return []
+
+        with open(export_files[0], 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+        accounts = payload.get('accounts', []) if isinstance(payload, dict) else []
+        rows = []
+        for account in accounts:
+            orders = account.get('orders', []) if isinstance(account, dict) else []
+            for order in orders:
+                option_symbol = order.get('option_symbol')
+                if not isinstance(option_symbol, dict):
+                    continue
+                underlying = option_symbol.get('underlying_symbol')
+                underlying_symbol = None
+                if isinstance(underlying, dict):
+                    underlying_symbol = underlying.get('symbol') or underlying.get('raw_symbol')
+                option_type = (option_symbol.get('option_type') or '').upper()
+                if option_type not in ('CALL', 'PUT'):
+                    option_type = None
+                action = (order.get('action') or '').upper()
+                filled_qty = _to_float(order.get('filled_quantity', order.get('total_quantity', 0)), 0.0)
+                total_qty = _to_float(order.get('total_quantity', filled_qty), filled_qty)
+                qty_for_display = filled_qty if filled_qty > 0 else total_qty
+                execution_price = _to_float(order.get('execution_price'), 0.0)
+                limit_price = _to_float(order.get('limit_price'), 0.0)
+                order_amount = execution_price * filled_qty * 100
+                if 'BUY' in action:
+                    order_amount = -abs(order_amount)
+                elif 'SELL' in action:
+                    order_amount = abs(order_amount)
+                rows.append({
+                    'id': f"order_{order.get('brokerage_order_id')}",
+                    'symbol': underlying_symbol or 'N/A',
+                    'type': 'OPTION_ORDER',
+                    'typeLabel': _normalize_type_label('OPTION_ORDER', action, True),
+                    'action': action or 'ORDER',
+                    'description': f"Order {(order.get('status') or 'UNKNOWN')}",
+                    'priceFromDescription': None,
+                    'date': order.get('time_executed') or order.get('time_placed') or '',
+                    'tradeDate': order.get('time_executed'),
+                    'settlementDate': None,
+                    'amount': order_amount,
+                    'fee': 0.0,
+                    'netAmount': order_amount,
+                    'quantity': qty_for_display,
+                    'units': qty_for_display,
+                    'price': execution_price,
+                    'isOption': True,
+                    'underlyingSymbol': underlying_symbol,
+                    'strikePrice': _to_float(option_symbol.get('strike_price'), None),
+                    'optionType': option_type,
+                    'expirationDate': option_symbol.get('expiration_date'),
+                    'contractCount': qty_for_display,
+                    'positionSide': 'LONG' if 'BUY' in action else ('SHORT' if 'SELL' in action else None),
+                    'limitPrice': limit_price,
+                    'executionPrice': execution_price,
+                    'placedTime': order.get('time_placed'),
+                    'executedTime': order.get('time_executed'),
+                    'feeBreakdown': {
+                        'occClearingFee': 0.0,
+                        'orfFee': 0.0,
+                        'otherFees': 0.0
+                    },
+                    'status': order.get('status') or 'UNKNOWN',
+                    'source': 'order'
+                })
+        return rows
+    except Exception as export_err:
+        print(f"Error loading option orders from export: {export_err}")
+        return []
+
 @app.route('/api/transactions', methods=['GET'])
 def get_transactions():
     """Get recent transactions"""
@@ -778,103 +859,123 @@ def get_transactions():
                     })
 
         # Include all option orders so options view can show open/pending/executed flow.
-        account_id = get_account_id()
-        if account_id:
+        # IMPORTANT: fetch across all accounts, not just the first account_id.
+        try:
+            accounts_response = snaptrade_client.account_information.list_user_accounts(
+                user_id=user_id,
+                user_secret=user_secret
+            )
+            all_accounts = getattr(accounts_response, 'body', None) or []
+        except Exception as accounts_err:
+            print(f"Error listing accounts for option orders: {accounts_err}")
+            all_accounts = []
+
+        order_rows_added = 0
+        if all_accounts:
             try:
-                orders_response = snaptrade_client.account_information.get_user_account_orders(
-                    user_id=user_id,
-                    user_secret=user_secret,
-                    account_id=account_id
-                )
-                orders_body = getattr(orders_response, 'body', None) or []
-                for order in orders_body:
-                    option_symbol = order.get('option_symbol')
-                    if not isinstance(option_symbol, dict):
+                for acc in all_accounts:
+                    account_id = acc.get('id')
+                    if not account_id:
                         continue
-
-                    underlying = option_symbol.get('underlying_symbol')
-                    underlying_symbol = None
-                    if isinstance(underlying, dict):
-                        underlying_symbol = underlying.get('symbol') or underlying.get('raw_symbol')
-
-                    option_type = (option_symbol.get('option_type') or '').upper()
-                    if option_type not in ('CALL', 'PUT'):
-                        option_type = None
-
-                    filled_qty = _to_float(order.get('filled_quantity', order.get('total_quantity', 0)), 0.0)
-                    total_qty = _to_float(order.get('total_quantity', filled_qty), filled_qty)
-                    action = (order.get('action') or '').upper()
-                    position_side = 'LONG' if 'BUY' in action else ('SHORT' if 'SELL' in action else None)
-                    side = 'BUY' if 'BUY' in action else ('SELL' if 'SELL' in action else None)
-
-                    limit_price = _to_float(order.get('limit_price'), 0.0)
-                    execution_price = _to_float(order.get('execution_price'), 0.0)
-                    status_value = order.get('status') or 'UNKNOWN'
-                    placed_time = order.get('time_placed')
-                    executed_time = order.get('time_executed')
-                    order_dt = _parse_iso_dt(executed_time or placed_time)
-                    key = _option_key(option_type, _to_float(option_symbol.get('strike_price'), None), option_symbol.get('expiration_date'), underlying_symbol)
-                    qty_for_display = filled_qty if filled_qty > 0 else total_qty
-                    matched_fee = 0.0
-                    best_delta = None
-                    for candidate in option_activity_candidates:
-                        if candidate['key'] != key or candidate['side'] != side:
+                    orders_response = snaptrade_client.account_information.get_user_account_orders(
+                        user_id=user_id,
+                        user_secret=user_secret,
+                        account_id=account_id
+                    )
+                    orders_body = getattr(orders_response, 'body', None) or []
+                    for order in orders_body:
+                        option_symbol = order.get('option_symbol')
+                        if not isinstance(option_symbol, dict):
                             continue
-                        if qty_for_display > 0 and candidate['units'] > 0 and abs(candidate['units'] - qty_for_display) > 0.0001:
-                            continue
-                        if execution_price > 0 and candidate['price'] > 0 and abs(candidate['price'] - execution_price) > 0.02:
-                            continue
-                        if order_dt and candidate['dt']:
-                            delta = abs((candidate['dt'] - order_dt).total_seconds())
-                        else:
-                            delta = 0
-                        if best_delta is None or delta < best_delta:
-                            best_delta = delta
-                            matched_fee = candidate['fee']
-                    order_amount = execution_price * filled_qty * 100
-                    if 'BUY' in action:
-                        order_amount = -abs(order_amount)
-                    elif 'SELL' in action:
-                        order_amount = abs(order_amount)
 
-                    transactions.append({
-                        'id': f"order_{order.get('brokerage_order_id')}",
-                        'symbol': underlying_symbol or 'N/A',
-                        'type': 'OPTION_ORDER',
-                        'typeLabel': _normalize_type_label('OPTION_ORDER', action, True),
-                        'action': action or 'ORDER',
-                        'description': f"Order {status_value}",
-                        'priceFromDescription': None,
-                        'date': executed_time or placed_time or '',
-                        'tradeDate': executed_time,
-                        'settlementDate': None,
-                        'amount': order_amount,
-                        'fee': matched_fee,
-                        'netAmount': order_amount - matched_fee,
-                        'quantity': qty_for_display,
-                        'units': qty_for_display,
-                        'price': execution_price,
-                        'isOption': True,
-                        'underlyingSymbol': underlying_symbol,
-                        'strikePrice': _to_float(option_symbol.get('strike_price'), None),
-                        'optionType': option_type,
-                        'expirationDate': option_symbol.get('expiration_date'),
-                        'contractCount': qty_for_display,
-                        'positionSide': position_side,
-                        'limitPrice': limit_price,
-                        'executionPrice': execution_price,
-                        'placedTime': placed_time,
-                        'executedTime': executed_time,
-                        'feeBreakdown': {
-                            'occClearingFee': 0.0,
-                            'orfFee': 0.0,
-                            'otherFees': matched_fee
-                        },
-                        'status': status_value,
-                        'source': 'order'
-                    })
+                        underlying = option_symbol.get('underlying_symbol')
+                        underlying_symbol = None
+                        if isinstance(underlying, dict):
+                            underlying_symbol = underlying.get('symbol') or underlying.get('raw_symbol')
+
+                        option_type = (option_symbol.get('option_type') or '').upper()
+                        if option_type not in ('CALL', 'PUT'):
+                            option_type = None
+
+                        filled_qty = _to_float(order.get('filled_quantity', order.get('total_quantity', 0)), 0.0)
+                        total_qty = _to_float(order.get('total_quantity', filled_qty), filled_qty)
+                        action = (order.get('action') or '').upper()
+                        position_side = 'LONG' if 'BUY' in action else ('SHORT' if 'SELL' in action else None)
+                        side = 'BUY' if 'BUY' in action else ('SELL' if 'SELL' in action else None)
+
+                        limit_price = _to_float(order.get('limit_price'), 0.0)
+                        execution_price = _to_float(order.get('execution_price'), 0.0)
+                        status_value = order.get('status') or 'UNKNOWN'
+                        placed_time = order.get('time_placed')
+                        executed_time = order.get('time_executed')
+                        order_dt = _parse_iso_dt(executed_time or placed_time)
+                        key = _option_key(option_type, _to_float(option_symbol.get('strike_price'), None), option_symbol.get('expiration_date'), underlying_symbol)
+                        qty_for_display = filled_qty if filled_qty > 0 else total_qty
+                        matched_fee = 0.0
+                        best_delta = None
+                        for candidate in option_activity_candidates:
+                            if candidate['key'] != key or candidate['side'] != side:
+                                continue
+                            if qty_for_display > 0 and candidate['units'] > 0 and abs(candidate['units'] - qty_for_display) > 0.0001:
+                                continue
+                            if execution_price > 0 and candidate['price'] > 0 and abs(candidate['price'] - execution_price) > 0.02:
+                                continue
+                            if order_dt and candidate['dt']:
+                                delta = abs((candidate['dt'] - order_dt).total_seconds())
+                            else:
+                                delta = 0
+                            if best_delta is None or delta < best_delta:
+                                best_delta = delta
+                                matched_fee = candidate['fee']
+                        order_amount = execution_price * filled_qty * 100
+                        if 'BUY' in action:
+                            order_amount = -abs(order_amount)
+                        elif 'SELL' in action:
+                            order_amount = abs(order_amount)
+
+                        transactions.append({
+                            'id': f"order_{order.get('brokerage_order_id')}",
+                            'symbol': underlying_symbol or 'N/A',
+                            'type': 'OPTION_ORDER',
+                            'typeLabel': _normalize_type_label('OPTION_ORDER', action, True),
+                            'action': action or 'ORDER',
+                            'description': f"Order {status_value}",
+                            'priceFromDescription': None,
+                            'date': executed_time or placed_time or '',
+                            'tradeDate': executed_time,
+                            'settlementDate': None,
+                            'amount': order_amount,
+                            'fee': matched_fee,
+                            'netAmount': order_amount - matched_fee,
+                            'quantity': qty_for_display,
+                            'units': qty_for_display,
+                            'price': execution_price,
+                            'isOption': True,
+                            'underlyingSymbol': underlying_symbol,
+                            'strikePrice': _to_float(option_symbol.get('strike_price'), None),
+                            'optionType': option_type,
+                            'expirationDate': option_symbol.get('expiration_date'),
+                            'contractCount': qty_for_display,
+                            'positionSide': position_side,
+                            'limitPrice': limit_price,
+                            'executionPrice': execution_price,
+                            'placedTime': placed_time,
+                            'executedTime': executed_time,
+                            'feeBreakdown': {
+                                'occClearingFee': 0.0,
+                                'orfFee': 0.0,
+                                'otherFees': matched_fee
+                            },
+                            'status': status_value,
+                            'source': 'order'
+                        })
+                        order_rows_added += 1
             except Exception as order_err:
                 print(f"Error getting option orders: {order_err}")
+
+        # Fallback to exported JSON snapshot when API order fetch returns nothing.
+        if order_rows_added == 0:
+            transactions.extend(_load_option_orders_from_latest_export())
         
         # Sort transactions by date (descending), then by time (descending), then by symbol (ascending)
         transactions.sort(key=lambda x: (

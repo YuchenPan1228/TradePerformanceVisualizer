@@ -26,6 +26,7 @@ const PortfolioDashboard = () => {
   const [groupFilter, setGroupFilter] = useState('all');
   const [transactionView, setTransactionView] = useState('stocks'); // 'stocks' | 'options'
   const [txPage, setTxPage] = useState(1);
+  const [expandedRows, setExpandedRows] = useState(new Set());
   const TX_PAGE_SIZE = 15;
 
   // Performance graph controls
@@ -252,6 +253,9 @@ const PortfolioDashboard = () => {
 
   // Reset to page 1 whenever any filter or view changes
   useEffect(() => { setTxPage(1); }, [symbolFilter, typeFilter, dateFilter, groupFilter, transactionView, customDateRange]);
+  useEffect(() => { setExpandedRows(new Set()); }, [symbolFilter, typeFilter, dateFilter, groupFilter, transactionView, customDateRange, txPage]);
+  // Type filter values differ between stocks vs options — reset when switching tabs
+  useEffect(() => { setTypeFilter('all'); }, [transactionView]);
 
   // ── Filter + sort transactions ───────────────────────────────────────────────
   const getFilteredTransactions = () => {
@@ -260,8 +264,12 @@ const PortfolioDashboard = () => {
     // Stock vs Options view filter
     filtered = filtered.filter(({ tx }) => {
       const type = tx.type || '';
-      const isOption = type.includes('OPTIONEXERCISE') || type.includes('OPTRD');
-      return transactionView === 'options' ? isOption : !isOption;
+      const isOptionRelated = Boolean(tx.isOption) || type.includes('OPTIONEXERCISE') || type.includes('OPTRD');
+      if (transactionView === 'options') {
+        // Options tab = brokerage option orders only (matches SnapTrade orders export), not activities/fills.
+        return tx.source === 'order' && tx.type === 'OPTION_ORDER';
+      }
+      return !isOptionRelated;
     });
 
     if (symbolFilter !== 'all') {
@@ -270,6 +278,22 @@ const PortfolioDashboard = () => {
 
     if (typeFilter !== 'all') {
       filtered = filtered.filter(({ tx }) => {
+        const act = (tx.action || '').toUpperCase();
+        const st = (tx.status || '').toUpperCase();
+
+        if (transactionView === 'options') {
+          if (typeFilter === 'buy') return act.includes('BUY');
+          if (typeFilter === 'sell') return act.includes('SELL');
+          if (typeFilter === 'executed') return st === 'EXECUTED' || st === 'FILLED';
+          if (typeFilter === 'expired') return st === 'EXPIRED';
+          if (typeFilter === 'canceled') return st === 'CANCELED' || st === 'CANCELLED';
+          if (typeFilter === 'pending') {
+            return st && !['EXECUTED', 'FILLED', 'EXPIRED', 'CANCELED', 'CANCELLED', 'REJECTED'].includes(st);
+          }
+          return true;
+        }
+
+        // Stocks / cash activity view
         if (typeFilter === 'buy') return tx.type === 'BUY';
         if (typeFilter === 'sell') return tx.type === 'SELL';
         if (typeFilter === 'fees') return tx.type === 'FEE';
@@ -940,284 +964,6 @@ const PortfolioDashboard = () => {
               )}
             </section>
 
-            {/* ── Recent Transactions ─────────────────────────────────────────── */}
-            <section className="bg-white rounded-2xl p-6 shadow-sm">
-              {/* Header row: title left, Stocks/Options toggle right */}
-              <div className="flex items-center justify-between mb-6">
-                <h2 className="text-2xl font-bold text-gray-900">Recent Transactions</h2>
-
-                {/* Stocks / Options segmented pill */}
-                <div className="flex rounded-lg border border-gray-200 overflow-hidden text-sm font-medium shadow-sm">
-                  <button
-                    onClick={() => setTransactionView('stocks')}
-                    className={`px-5 py-2 transition-colors ${transactionView === 'stocks'
-                      ? 'bg-blue-600 text-white'
-                      : 'bg-white text-gray-500 hover:bg-gray-50'
-                      }`}
-                  >
-                    Stocks
-                  </button>
-                  <button
-                    onClick={() => setTransactionView('options')}
-                    className={`px-5 py-2 border-l border-gray-200 transition-colors ${transactionView === 'options'
-                      ? 'bg-blue-600 text-white'
-                      : 'bg-white text-gray-500 hover:bg-gray-50'
-                      }`}
-                  >
-                    Options
-                  </button>
-                </div>
-              </div>
-
-              <div className="mb-6 space-y-4">
-                <div className="flex flex-wrap gap-4">
-                  {/* Symbol filter */}
-                  <div className="flex-1 min-w-[160px]">
-                    <label className="block text-sm font-medium text-gray-700 mb-2">Symbol</label>
-                    <select value={symbolFilter} onChange={(e) => setSymbolFilter(e.target.value)}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-                      <option value="all">All Symbols</option>
-                      {getUniqueSymbols().map(symbol => <option key={symbol} value={symbol}>{symbol}</option>)}
-                    </select>
-                  </div>
-
-                  {/* Type filter */}
-                  <div className="flex-1 min-w-[160px]">
-                    <label className="block text-sm font-medium text-gray-700 mb-2">Type</label>
-                    <select value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-                      <option value="all">All Types</option>
-                      <option value="buy">Buy Orders</option>
-                      <option value="sell">Sell Orders</option>
-                      <option value="fill">Fills</option>
-                      <option value="partial">Partial Fills</option>
-                      <option value="fees">Fees Only</option>
-                      <option value="deposits">Deposits/Withdrawals</option>
-                    </select>
-                  </div>
-
-                  {/* Date filter */}
-                  <div className="flex-1 min-w-[160px]">
-                    <label className="block text-sm font-medium text-gray-700 mb-2">Date Range</label>
-                    <select value={dateFilter} onChange={(e) => setDateFilter(e.target.value)}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-                      <option value="all">All Time</option>
-                      <option value="today">Today</option>
-                      <option value="week">Last 7 Days</option>
-                      <option value="month">Last 30 Days</option>
-                      <option value="custom">Custom Range</option>
-                    </select>
-                  </div>
-
-                  {/* Order Group filter */}
-                  <div className="flex-1 min-w-[160px]">
-                    <label className="block text-sm font-medium text-gray-700 mb-2">Order Group</label>
-                    <select value={groupFilter} onChange={(e) => setGroupFilter(e.target.value)}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-violet-500">
-                      <option value="all">All Groups</option>
-                      {availableGroups.map(g => (
-                        <option key={g} value={g}>Group #{g}</option>
-                      ))}
-                    </select>
-                  </div>
-                </div>
-
-                {dateFilter === 'custom' && (
-                  <div className="flex gap-4 items-end">
-                    <div className="flex-1">
-                      <label className="block text-sm font-medium text-gray-700 mb-2">Start Date</label>
-                      <input type="date" value={customDateRange.start}
-                        onChange={(e) => setCustomDateRange({ ...customDateRange, start: e.target.value })}
-                        className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
-                    </div>
-                    <div className="flex-1">
-                      <label className="block text-sm font-medium text-gray-700 mb-2">End Date</label>
-                      <input type="date" value={customDateRange.end}
-                        onChange={(e) => setCustomDateRange({ ...customDateRange, end: e.target.value })}
-                        className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
-                    </div>
-                  </div>
-                )}
-
-                {(symbolFilter !== 'all' || typeFilter !== 'all' || dateFilter !== 'all' || groupFilter !== 'all') && (
-                  <div className="flex items-center justify-between pt-2 border-t border-gray-200">
-                    <div className="flex flex-wrap items-center gap-2 text-sm text-gray-600">
-                      <span>Active filters:</span>
-                      {symbolFilter !== 'all' && <span className="px-2 py-1 bg-blue-100 text-blue-700 rounded-md">Symbol: {symbolFilter}</span>}
-                      {typeFilter !== 'all' && <span className="px-2 py-1 bg-blue-100 text-blue-700 rounded-md">Type: {typeFilter}</span>}
-                      {dateFilter !== 'all' && <span className="px-2 py-1 bg-blue-100 text-blue-700 rounded-md">Date: {dateFilter === 'custom' ? 'Custom' : dateFilter}</span>}
-                      {groupFilter !== 'all' && <span className="px-2 py-1 bg-violet-100 text-violet-700 rounded-md">Group: #{groupFilter}</span>}
-                    </div>
-                    <button
-                      onClick={() => {
-                        setSymbolFilter('all');
-                        setTypeFilter('all');
-                        setDateFilter('all');
-                        setCustomDateRange({ start: '', end: '' });
-                        setGroupFilter('all');
-                        setTransactionView('stocks');
-                      }}
-                      className="text-sm text-blue-600 hover:text-blue-800 font-medium">
-                      Clear All Filters
-                    </button>
-                  </div>
-                )}
-              </div>
-
-              {(() => {
-                const filteredRows = getFilteredTransactions();
-                const totalPages = Math.max(1, Math.ceil(filteredRows.length / TX_PAGE_SIZE));
-                const safePage = Math.min(txPage, totalPages);
-                const pageRows = filteredRows.slice((safePage - 1) * TX_PAGE_SIZE, safePage * TX_PAGE_SIZE);
-
-                return filteredRows.length > 0 ? (
-                  <div className="overflow-x-auto">
-                    <table className="w-full">
-                      <thead>
-                        <tr className="text-left text-sm text-gray-500 border-b">
-                          <th className="pb-3 font-medium text-center w-16">Order #</th>
-                          <th className="pb-3 font-medium">Symbol</th>
-                          <th className="pb-3 font-medium">Action</th>
-                          <th className="pb-3 font-medium">Date & Time</th>
-                          <th className="pb-3 font-medium text-right">Amount</th>
-                          <th className="pb-3 font-medium text-right">Shares</th>
-                          <th className="pb-3 font-medium text-center">Type</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {pageRows.map(({ tx, originalIdx }, rowIdx) => {
-                          const orderGroup = orderGroupMap.get(originalIdx);
-                          const txDate = tx.date ? new Date(tx.date) : new Date();
-                          const dateStr = txDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-                          const timeStr = txDate.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
-                          const displaySymbol = tx.symbol && tx.symbol !== 'N/A' ? tx.symbol : '—';
-                          const isBuyFill = tx.action && (tx.action.includes('BUY FILL') || tx.action.includes('BUY PARTIAL_FILL'));
-                          const price = tx.priceFromDescription ? parseFloat(String(tx.priceFromDescription).replace(/,/g, '')) : (tx.price || 0);
-                          const shares = isBuyFill && price > 0 && tx.amount ? (Math.abs(tx.amount) / price) : null;
-
-                          return (
-                            <tr key={rowIdx} className="border-b last:border-0 hover:bg-gray-50 transition-colors">
-                              <td className="py-4 text-center">
-                                {orderGroup !== undefined ? (
-                                  <span className="inline-flex items-center justify-center w-8 h-8 rounded-full text-xs font-bold bg-violet-100 text-violet-700 border border-violet-200">
-                                    {orderGroup}
-                                  </span>
-                                ) : (
-                                  <span className="text-gray-300 text-xs">—</span>
-                                )}
-                              </td>
-
-                              <td className="py-4">
-                                <div className="font-bold text-gray-900">{displaySymbol}</div>
-                              </td>
-
-                              <td className="py-4">
-                                <div className="font-medium text-gray-900">{tx.action || tx.type}</div>
-                                {tx.priceFromDescription && (
-                                  <div className="text-xs text-gray-500">at ${tx.priceFromDescription}</div>
-                                )}
-                              </td>
-
-                              <td className="py-4">
-                                <div className="text-gray-900 text-sm font-medium">{dateStr}</div>
-                                <div className="text-gray-500 text-xs">{timeStr}</div>
-                              </td>
-
-                              <td className="py-4 text-right">
-                                <div className={`font-semibold ${tx.amount >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                                  {tx.amount >= 0 ? '+' : ''}${Math.abs(tx.amount).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                                </div>
-                              </td>
-
-                              <td className="py-4 text-right">
-                                {shares !== null
-                                  ? <div className="font-medium text-gray-900">{shares.toLocaleString(undefined, { maximumFractionDigits: 4 })}</div>
-                                  : <div className="text-gray-400">—</div>}
-                              </td>
-
-                              <td className="py-4 text-center">
-                                <span className={`inline-block px-2 py-1 rounded text-xs font-medium ${tx.type === 'BUY' ? 'bg-blue-100 text-blue-700' :
-                                  tx.type === 'SELL' ? 'bg-orange-100 text-orange-700' :
-                                    tx.type === 'FEE' ? 'bg-gray-100 text-gray-700' :
-                                      tx.type === 'JNLC' ? 'bg-green-100 text-green-700' :
-                                        'bg-gray-100 text-gray-700'
-                                  }`}>
-                                  {tx.type === 'JNLC' ? 'DEPOSIT' : safeText(tx.type)}
-                                </span>
-                              </td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-
-                    {/* ── Pagination bar ── */}
-                    <div className="mt-5 flex items-center justify-between border-t border-gray-100 pt-4">
-                      <p className="text-sm text-gray-500">
-                        Showing{' '}
-                        <span className="font-medium text-gray-700">
-                          {(safePage - 1) * TX_PAGE_SIZE + 1}–{Math.min(safePage * TX_PAGE_SIZE, filteredRows.length)}
-                        </span>{' '}
-                        of <span className="font-medium text-gray-700">{filteredRows.length}</span> transactions
-                      </p>
-
-                      <div className="flex items-center gap-1">
-                        {/* Prev */}
-                        <button
-                          onClick={() => setTxPage(p => Math.max(1, p - 1))}
-                          disabled={safePage === 1}
-                          className="px-3 py-1.5 rounded-md text-sm font-medium border border-gray-200 bg-white text-gray-600 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-                        >
-                          ← Prev
-                        </button>
-
-                        {/* Page number pills */}
-                        {Array.from({ length: totalPages }, (_, i) => i + 1)
-                          .filter(p => p === 1 || p === totalPages || Math.abs(p - safePage) <= 1)
-                          .reduce((acc, p, idx, arr) => {
-                            if (idx > 0 && p - arr[idx - 1] > 1) acc.push('…');
-                            acc.push(p);
-                            return acc;
-                          }, [])
-                          .map((item, idx) =>
-                            item === '…' ? (
-                              <span key={`ellipsis-${idx}`} className="px-2 text-gray-400 text-sm">…</span>
-                            ) : (
-                              <button
-                                key={item}
-                                onClick={() => setTxPage(item)}
-                                className={`w-8 h-8 rounded-md text-sm font-medium transition-colors ${item === safePage
-                                  ? 'bg-blue-600 text-white'
-                                  : 'border border-gray-200 bg-white text-gray-600 hover:bg-gray-50'
-                                  }`}
-                              >
-                                {item}
-                              </button>
-                            )
-                          )}
-
-                        {/* Next */}
-                        <button
-                          onClick={() => setTxPage(p => Math.min(totalPages, p + 1))}
-                          disabled={safePage === totalPages}
-                          className="px-3 py-1.5 rounded-md text-sm font-medium border border-gray-200 bg-white text-gray-600 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-                        >
-                          Next →
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="text-center py-12">
-                    <div className="text-gray-400 mb-2">
-                      <Search className="w-12 h-12 mx-auto mb-3" />
-                    </div>
-                    <p className="text-gray-500 font-medium">No transactions match your filters</p>
-                    <p className="text-gray-400 text-sm mt-1">Try adjusting your filter criteria</p>
-                  </div>
-                );
-              })()}
-            </section>
           </div>
 
           <aside className="space-y-6">
@@ -1227,7 +973,9 @@ const PortfolioDashboard = () => {
                 <div key={idx} className="flex items-center justify-between mb-3">
                   <div>
                     <div className="font-bold text-gray-900">{safeText(holding.symbol)}</div>
-                    <div className="text-xs text-gray-500">{holding.quantity} shares</div>
+                    <div className="text-xs text-gray-500">
+                      Avg Cost Basis: ${holding.quantity > 0 ? (holding.costBasis / holding.quantity).toFixed(2) : '0.00'}
+                    </div>
                   </div>
                   <div className="text-right">
                     <div className="font-bold text-gray-900">${holding.marketValue.toFixed(2)}</div>
@@ -1264,6 +1012,389 @@ const PortfolioDashboard = () => {
             </section>
           </aside>
         </div>
+
+        {/* ── Recent Transactions ─────────────────────────────────────────── */}
+        <section className="bg-white rounded-2xl p-6 shadow-sm mt-6">
+          {/* Header row: title left, Stocks/Options toggle right */}
+          <div className="flex items-center justify-between mb-6">
+            <h2 className="text-2xl font-bold text-gray-900">Recent Transactions</h2>
+
+            {/* Stocks / Options segmented pill */}
+            <div className="flex rounded-lg border border-gray-200 overflow-hidden text-sm font-medium shadow-sm">
+              <button
+                onClick={() => setTransactionView('stocks')}
+                className={`px-5 py-2 transition-colors ${transactionView === 'stocks'
+                  ? 'bg-blue-600 text-white'
+                  : 'bg-white text-gray-500 hover:bg-gray-50'
+                  }`}
+              >
+                Stocks
+              </button>
+              <button
+                onClick={() => setTransactionView('options')}
+                className={`px-5 py-2 border-l border-gray-200 transition-colors ${transactionView === 'options'
+                  ? 'bg-blue-600 text-white'
+                  : 'bg-white text-gray-500 hover:bg-gray-50'
+                  }`}
+              >
+                Options
+              </button>
+            </div>
+          </div>
+
+          <div className="mb-6 space-y-4">
+            <div className="flex flex-wrap gap-4">
+              {/* Symbol filter */}
+              <div className="flex-1 min-w-[160px]">
+                <label className="block text-sm font-medium text-gray-700 mb-2">Symbol</label>
+                <select value={symbolFilter} onChange={(e) => setSymbolFilter(e.target.value)}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+                  <option value="all">All Symbols</option>
+                  {getUniqueSymbols().map(symbol => <option key={symbol} value={symbol}>{symbol}</option>)}
+                </select>
+              </div>
+
+              {/* Type filter */}
+              <div className="flex-1 min-w-[160px]">
+                <label className="block text-sm font-medium text-gray-700 mb-2">Type</label>
+                <select value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+                  <option value="all">All Types</option>
+                  {transactionView === 'stocks' ? (
+                    <>
+                      <option value="buy">Buy</option>
+                      <option value="sell">Sell</option>
+                      <option value="fill">Fills</option>
+                      <option value="partial">Partial Fills</option>
+                      <option value="fees">Fees Only</option>
+                      <option value="deposits">Deposits / Withdrawals</option>
+                    </>
+                  ) : (
+                    <>
+                      <option value="buy">Buy</option>
+                      <option value="sell">Sell</option>
+                      <option value="executed">Executed</option>
+                      <option value="expired">Expired</option>
+                      <option value="canceled">Canceled</option>
+                      <option value="pending">Pending / Other</option>
+                    </>
+                  )}
+                </select>
+              </div>
+
+              {/* Date filter */}
+              <div className="flex-1 min-w-[160px]">
+                <label className="block text-sm font-medium text-gray-700 mb-2">Date Range</label>
+                <select value={dateFilter} onChange={(e) => setDateFilter(e.target.value)}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+                  <option value="all">All Time</option>
+                  <option value="today">Today</option>
+                  <option value="week">Last 7 Days</option>
+                  <option value="month">Last 30 Days</option>
+                  <option value="custom">Custom Range</option>
+                </select>
+              </div>
+
+              {/* Order Group filter */}
+              <div className="flex-1 min-w-[160px]">
+                <label className="block text-sm font-medium text-gray-700 mb-2">Order Group</label>
+                <select value={groupFilter} onChange={(e) => setGroupFilter(e.target.value)}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-violet-500">
+                  <option value="all">All Groups</option>
+                  {availableGroups.map(g => (
+                    <option key={g} value={g}>Group #{g}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            {dateFilter === 'custom' && (
+              <div className="flex gap-4 items-end">
+                <div className="flex-1">
+                  <label className="block text-sm font-medium text-gray-700 mb-2">Start Date</label>
+                  <input type="date" value={customDateRange.start}
+                    onChange={(e) => setCustomDateRange({ ...customDateRange, start: e.target.value })}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                </div>
+                <div className="flex-1">
+                  <label className="block text-sm font-medium text-gray-700 mb-2">End Date</label>
+                  <input type="date" value={customDateRange.end}
+                    onChange={(e) => setCustomDateRange({ ...customDateRange, end: e.target.value })}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                </div>
+              </div>
+            )}
+
+            {(symbolFilter !== 'all' || typeFilter !== 'all' || dateFilter !== 'all' || groupFilter !== 'all') && (
+              <div className="flex items-center justify-between pt-2 border-t border-gray-200">
+                <div className="flex flex-wrap items-center gap-2 text-sm text-gray-600">
+                  <span>Active filters:</span>
+                  {symbolFilter !== 'all' && <span className="px-2 py-1 bg-blue-100 text-blue-700 rounded-md">Symbol: {symbolFilter}</span>}
+                  {typeFilter !== 'all' && <span className="px-2 py-1 bg-blue-100 text-blue-700 rounded-md">Type: {typeFilter}</span>}
+                  {dateFilter !== 'all' && <span className="px-2 py-1 bg-blue-100 text-blue-700 rounded-md">Date: {dateFilter === 'custom' ? 'Custom' : dateFilter}</span>}
+                  {groupFilter !== 'all' && <span className="px-2 py-1 bg-violet-100 text-violet-700 rounded-md">Group: #{groupFilter}</span>}
+                </div>
+                <button
+                  onClick={() => {
+                    setSymbolFilter('all');
+                    setTypeFilter('all');
+                    setDateFilter('all');
+                    setCustomDateRange({ start: '', end: '' });
+                    setGroupFilter('all');
+                    setTransactionView('stocks');
+                  }}
+                  className="text-sm text-blue-600 hover:text-blue-800 font-medium">
+                  Clear All Filters
+                </button>
+              </div>
+            )}
+          </div>
+
+          {(() => {
+            const filteredRows = getFilteredTransactions();
+            const totalPages = Math.max(1, Math.ceil(filteredRows.length / TX_PAGE_SIZE));
+            const safePage = Math.min(txPage, totalPages);
+            const pageRows = filteredRows.slice((safePage - 1) * TX_PAGE_SIZE, safePage * TX_PAGE_SIZE);
+
+            return filteredRows.length > 0 ? (
+              <div className="overflow-x-auto">
+                <table className="w-full">
+                  <thead>
+                    <tr className="text-left text-sm text-gray-500 border-b">
+                      {transactionView !== 'options' && <th className="pb-3 font-medium text-center w-16">Order #</th>}
+                      <th className="pb-3 font-medium">Symbol</th>
+                      {transactionView === 'options' && (
+                        <>
+                          <th className="pb-3 font-medium text-center">Call/Put</th>
+                          <th className="pb-3 font-medium text-center">Expiration Date</th>
+                        </>
+                      )}
+                      <th className="pb-3 font-medium">Action</th>
+                      {transactionView === 'options' && (
+                        <>
+                          <th className="pb-3 font-medium text-right">Strike Price</th>
+                          <th className="pb-3 font-medium text-center">Quantity</th>
+                        </>
+                      )}
+                      <th className="pb-3 font-medium">Date & Time</th>
+                      <th className="pb-3 font-medium text-right">
+                        {transactionView === 'options' ? 'Limit Price' : 'Price / Share'}
+                      </th>
+                      <th className="pb-3 font-medium text-right">
+                        {transactionView === 'options' ? 'Execution Price' : 'Amount'}
+                      </th>
+                      {transactionView !== 'options' && <th className="pb-3 font-medium text-right">Shares</th>}
+                      {transactionView === 'options' && <th className="pb-3 font-medium text-center">Status</th>}
+                      <th className="pb-3 font-medium text-center">Type</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {pageRows.map(({ tx, originalIdx }, rowIdx) => {
+                      const orderGroup = orderGroupMap.get(originalIdx);
+                      const txDate = tx.date ? new Date(tx.date) : new Date();
+                      const dateStr = txDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+                      const timeStr = txDate.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
+                      const displaySymbol = tx.symbol && tx.symbol !== 'N/A' ? tx.symbol : '—';
+                      const isBuyFill = tx.action && (tx.action.includes('BUY FILL') || tx.action.includes('BUY PARTIAL_FILL'));
+                      const price = tx.priceFromDescription ? parseFloat(String(tx.priceFromDescription).replace(/,/g, '')) : (tx.price || 0);
+                      const limitPrice = Number(tx.limitPrice ?? 0);
+                      const executionPrice = Number(tx.executionPrice ?? price ?? 0);
+                      const shares = tx.units ?? (isBuyFill && price > 0 && tx.amount ? (Math.abs(tx.amount) / price) : null);
+                      const isExpanded = expandedRows.has(originalIdx);
+
+                      return (
+                        <React.Fragment key={rowIdx}>
+                        <tr
+                          className={`border-b hover:bg-gray-50 transition-colors ${tx.isOption ? 'cursor-pointer' : ''}`}
+                          onClick={() => {
+                            if (!tx.isOption) return;
+                            const next = new Set(expandedRows);
+                            if (next.has(originalIdx)) next.delete(originalIdx);
+                            else next.add(originalIdx);
+                            setExpandedRows(next);
+                          }}
+                        >
+                          {transactionView !== 'options' && (
+                            <td className="py-4 text-center align-top">
+                              {orderGroup !== undefined ? (
+                                <span className="inline-flex items-center justify-center w-8 h-8 rounded-full text-xs font-bold bg-violet-100 text-violet-700 border border-violet-200">
+                                  {orderGroup}
+                                </span>
+                              ) : (
+                                <span className="text-gray-300 text-xs">—</span>
+                              )}
+                            </td>
+                          )}
+
+                          <td className="py-4 align-top">
+                            <div className="font-bold text-gray-900">{displaySymbol}</div>
+                          </td>
+
+                          {transactionView === 'options' && (
+                            <>
+                              <td className="py-4 text-center align-top">{tx.optionType || '—'}</td>
+                              <td className="py-4 text-center align-top">{tx.expirationDate || '—'}</td>
+                            </>
+                          )}
+
+                          <td className="py-4 align-top">
+                            <div className="font-medium text-gray-900">{tx.action || tx.type}</div>
+                            {tx.priceFromDescription && (
+                              <div className="text-xs text-gray-500">at ${tx.priceFromDescription}</div>
+                            )}
+                          </td>
+
+                          {transactionView === 'options' && (
+                            <>
+                              <td className="py-4 text-right align-top">
+                                <div className="font-medium text-gray-900">
+                                  {tx.strikePrice ? `$${Number(tx.strikePrice).toFixed(2)}` : '—'}
+                                </div>
+                              </td>
+                              <td className="py-4 text-center align-top">
+                                <div className="font-medium text-gray-900">
+                                  {Number(tx.quantity ?? tx.contractCount ?? 0).toLocaleString(undefined, { maximumFractionDigits: 4 })}
+                                </div>
+                              </td>
+                            </>
+                          )}
+
+                          <td className="py-4 align-top">
+                            <div className="text-gray-900 text-sm font-medium">{dateStr}</div>
+                            <div className="text-gray-500 text-xs">{timeStr}</div>
+                          </td>
+
+                          <td className="py-4 text-right align-top">
+                            <div className="font-medium text-gray-900">
+                              ${(transactionView === 'options' ? limitPrice : Number(price || 0)).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}
+                            </div>
+                          </td>
+
+                          <td className="py-4 text-right align-top">
+                            {transactionView === 'options' ? (
+                              <div className="font-medium text-gray-900">
+                                ${executionPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}
+                              </div>
+                            ) : (
+                              <div className={`font-semibold ${tx.amount >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                                {tx.amount >= 0 ? '+' : ''}${Math.abs(tx.amount).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                              </div>
+                            )}
+                          </td>
+
+                          {transactionView !== 'options' && (
+                            <td className="py-4 text-right align-top">
+                              {shares !== null
+                                ? <div className="font-medium text-gray-900">{shares.toLocaleString(undefined, { maximumFractionDigits: 4 })}</div>
+                                : <div className="text-gray-400">—</div>}
+                            </td>
+                          )}
+
+                          {transactionView === 'options' && (
+                            <td className="py-4 text-center align-top">
+                              <span className="inline-block px-2 py-1 rounded text-xs font-medium bg-slate-100 text-slate-700">
+                                {safeText(tx.status || 'UNKNOWN')}
+                              </span>
+                            </td>
+                          )}
+
+                          <td className="py-4 text-center align-top">
+                            <span className={`inline-block px-2 py-1 rounded text-xs font-medium ${tx.type === 'BUY' ? 'bg-blue-100 text-blue-700' :
+                              tx.type === 'SELL' ? 'bg-orange-100 text-orange-700' :
+                                tx.type === 'FEE' ? 'bg-gray-100 text-gray-700' :
+                                  tx.type === 'JNLC' ? 'bg-green-100 text-green-700' :
+                                    'bg-gray-100 text-gray-700'
+                              }`}>
+                              {tx.typeLabel || (tx.type === 'JNLC' ? 'DEPOSIT' : safeText(tx.type))}
+                            </span>
+                          </td>
+                        </tr>
+                        {tx.isOption && isExpanded && (
+                          <tr className="border-b bg-gray-50/60">
+                            <td colSpan={transactionView === 'options' ? 11 : 8} className="py-3 px-4">
+                              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
+                                <div>
+                                  <div className="text-xs text-gray-500">Placed Time</div>
+                                  <div className="font-medium text-gray-900">{tx.placedTime || '—'}</div>
+                                </div>
+                                <div>
+                                  <div className="text-xs text-gray-500">Executed Time</div>
+                                  <div className="font-medium text-gray-900">{tx.executedTime || tx.tradeDate || '—'}</div>
+                                </div>
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                        </React.Fragment>
+                      );
+                    })}
+                  </tbody>
+                </table>
+
+                {/* ── Pagination bar ── */}
+                <div className="mt-5 flex items-center justify-between border-t border-gray-100 pt-4">
+                  <p className="text-sm text-gray-500">
+                    Showing{' '}
+                    <span className="font-medium text-gray-700">
+                      {(safePage - 1) * TX_PAGE_SIZE + 1}–{Math.min(safePage * TX_PAGE_SIZE, filteredRows.length)}
+                    </span>{' '}
+                    of <span className="font-medium text-gray-700">{filteredRows.length}</span> transactions
+                  </p>
+
+                  <div className="flex items-center gap-1">
+                    <button
+                      onClick={() => setTxPage(p => Math.max(1, p - 1))}
+                      disabled={safePage === 1}
+                      className="px-3 py-1.5 rounded-md text-sm font-medium border border-gray-200 bg-white text-gray-600 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                    >
+                      ← Prev
+                    </button>
+
+                    {Array.from({ length: totalPages }, (_, i) => i + 1)
+                      .filter(p => p === 1 || p === totalPages || Math.abs(p - safePage) <= 1)
+                      .reduce((acc, p, idx, arr) => {
+                        if (idx > 0 && p - arr[idx - 1] > 1) acc.push('…');
+                        acc.push(p);
+                        return acc;
+                      }, [])
+                      .map((item, idx) =>
+                        item === '…' ? (
+                          <span key={`ellipsis-${idx}`} className="px-2 text-gray-400 text-sm">…</span>
+                        ) : (
+                          <button
+                            key={item}
+                            onClick={() => setTxPage(item)}
+                            className={`w-8 h-8 rounded-md text-sm font-medium transition-colors ${item === safePage
+                              ? 'bg-blue-600 text-white'
+                              : 'border border-gray-200 bg-white text-gray-600 hover:bg-gray-50'
+                              }`}
+                          >
+                            {item}
+                          </button>
+                        )
+                      )}
+
+                    <button
+                      onClick={() => setTxPage(p => Math.min(totalPages, p + 1))}
+                      disabled={safePage === totalPages}
+                      className="px-3 py-1.5 rounded-md text-sm font-medium border border-gray-200 bg-white text-gray-600 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                    >
+                      Next →
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="text-center py-12">
+                <div className="text-gray-400 mb-2">
+                  <Search className="w-12 h-12 mx-auto mb-3" />
+                </div>
+                <p className="text-gray-500 font-medium">No transactions match your filters</p>
+                <p className="text-gray-400 text-sm mt-1">Try adjusting your filter criteria</p>
+              </div>
+            );
+          })()}
+        </section>
       </main>
     </div>
   );

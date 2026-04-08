@@ -773,6 +773,60 @@ def _load_option_orders_from_latest_export():
         print(f"Error loading option orders from export: {export_err}")
         return []
 
+
+def _snaptrade_activities_page_items(page_body):
+    """
+    Account-level activities return PaginatedUniversalActivity: { "data": [...], "pagination": {...} }.
+    User-level get_activities returns a plain list. Normalize to a list of activity dicts.
+    """
+    if page_body is None:
+        return []
+    if isinstance(page_body, list):
+        return page_body
+    if isinstance(page_body, dict):
+        return page_body.get('data') or []
+    data = getattr(page_body, 'data', None)
+    if data is not None:
+        return list(data) if not isinstance(data, list) else data
+    return []
+
+
+def _fetch_activities_body(snaptrade_client, user_id, user_secret, account_id):
+    """
+    Load universal activities for the dashboard transaction table.
+    Prefer the account-scoped endpoint so the list matches a single brokerage
+    account (same as positions and option orders). The user-level get_activities
+    API returns activities across *all* connections for that SnapTrade user,
+    which often explodes the count (e.g. hundreds) vs. what you see for one account.
+    """
+    if account_id:
+        activities_body = []
+        offset = 0
+        page_size = 1000
+        while True:
+            resp = snaptrade_client.account_information.get_account_activities(
+                account_id=account_id,
+                user_id=user_id,
+                user_secret=user_secret,
+                offset=offset,
+                limit=page_size,
+            )
+            page_body = getattr(resp, 'body', None)
+            batch = _snaptrade_activities_page_items(page_body)
+            if not batch:
+                break
+            activities_body.extend(batch)
+            if len(batch) < page_size:
+                break
+            offset += page_size
+        return activities_body
+    activities_response = snaptrade_client.transactions_and_reporting.get_activities(
+        user_id=user_id,
+        user_secret=user_secret
+    )
+    return getattr(activities_response, 'body', None) or []
+
+
 @app.route('/api/transactions', methods=['GET'])
 def get_transactions():
     """Get recent transactions"""
@@ -782,13 +836,11 @@ def get_transactions():
             return jsonify({'success': False, 'error': 'Not authenticated'}), 401
         
         snaptrade_client = get_snaptrade_client()
-        
+        account_id = get_account_id()
         transactions = []
-        activities_response = snaptrade_client.transactions_and_reporting.get_activities(
-            user_id=user_id,
-            user_secret=user_secret
+        activities_body = _fetch_activities_body(
+            snaptrade_client, user_id, user_secret, account_id
         )
-        activities_body = getattr(activities_response, 'body', None) or []
         option_activity_candidates = []
         if activities_body:
             for activity in activities_body:
@@ -858,9 +910,8 @@ def get_transactions():
                         'dt': _parse_iso_dt(activity.get('trade_date') or activity.get('settlement_date'))
                     })
 
-        # Option orders from primary account only (stored first account / get_account_id).
+        # Option orders from primary account only (same account_id as activities above).
         order_rows_added = 0
-        account_id = get_account_id()
         if account_id:
             try:
                 orders_response = snaptrade_client.account_information.get_user_account_orders(
@@ -969,7 +1020,6 @@ def get_transactions():
             x['symbol']
         ))
         
-        # Return only the first 10 transactions
         return jsonify({
             'success': True,
             'data': transactions

@@ -1,0 +1,13 @@
+{
+  "exampleUser": {
+    "username": "exampleUser",
+    "password_hash": "<sha256-or-werkzeug-hash, set at registration>",
+    "snaptrade_user_id": "<snaptrade user id>",
+    "snaptrade_user_secret": "<snaptrade user secret>",
+    "redirect_uri": "<snaptrade connection portal url>",
+    "session_id": "<active session id, optional>",
+    "account_connected": false,
+    "created_at": "2026-01-01T00:00:00",
+    "accounts_fetched_at": null
+  }
+}

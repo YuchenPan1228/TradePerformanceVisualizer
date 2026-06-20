@@ -1,0 +1,16 @@
+# dependencies
+node_modules/
+
+# build output
+build/
+
+# env (keep .env.example)
+.env
+.env.*
+!.env.example
+
+# logs
+*.log
+
+# OS
+.DS_Store

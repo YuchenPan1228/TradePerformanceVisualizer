@@ -1,5 +1,6 @@
-from flask import Flask, jsonify, request, session
+from flask import Flask, jsonify, request, session, Response
 from flask_cors import CORS
+from functools import wraps
 import os
 from datetime import datetime, timedelta
 from snaptrade_client import SnapTrade
@@ -8,6 +9,8 @@ import yfinance as yf
 import logging
 import hashlib
 import secrets
+import requests
+from requests.adapters import HTTPAdapter
 import re
 import glob
 
@@ -16,13 +19,53 @@ app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
 CORS(app, supports_credentials=True, origins=['http://localhost:3000', 'http://localhost:3001', 'http://127.0.0.1:3000', 'http://127.0.0.1:3001', 'http://18.221.160.103:5001', 'http://18.221.160.103:3000', 'http://bfi.duckdns.org'])
 
 # Configuration
-SNAPTRADE_CLIENT_ID = "BFI-DFTUD"
+SNAPTRADE_CLIENT_ID ="BFI-DFTUD",
 SNAPTRADE_CONSUMER_KEY = "UflJTFaCJXSpEEmoGaEjtotESLszJnvFlXrglda7xlWRbAgb6y"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTTP Basic Auth for the internal SnapTrade data platform (/api/explorer/*,
+# /api/db/*). This is a lightweight shared-credentials gate for the creators-only
+# data explorer — NOT the user-facing dashboard, which uses session auth.
+# Override the defaults via env vars EXPLORER_USER / EXPLORER_PASS.
+# ─────────────────────────────────────────────────────────────────────────────
+EXPLORER_USER = os.environ.get('EXPLORER_USER', 'admin')
+EXPLORER_PASS = os.environ.get('EXPLORER_PASS', 'changeme')
+
+
+def require_basic_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth = request.authorization
+        if not auth or auth.username != EXPLORER_USER or auth.password != EXPLORER_PASS:
+            return Response(
+                'Authentication required.', 401,
+                {'WWW-Authenticate': 'Basic realm="SnapTrade Data Platform"'}
+            )
+        return f(*args, **kwargs)
+    return decorated
+
 
 # Database files
 USERS_DB_FILE = 'users.json'
 ACCOUNT_DATA_DIR = 'data-export'
 ACCOUNT_DATA_FILE = os.path.join(ACCOUNT_DATA_DIR, 'account-data.json')
+
+
+from models import db, User, Account, Position, Order, Activity
+from db_sync import sync_export_to_db
+
+# PostgreSQL connection — set DATABASE_URL env var or hardcode for dev
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get(
+    'DATABASE_URL',
+    'postgresql://snaptrade_user:testing@localhost/snaptrade_db'
+)
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db.init_app(app)
+
+# Create tables on startup
+with app.app_context():
+    db.create_all()
 
 # Ensure data-export directory exists
 os.makedirs(ACCOUNT_DATA_DIR, exist_ok=True)
@@ -87,6 +130,15 @@ WATCHLIST = [
     'XOM','UNH','JNJ','PG',
     'SPY','QQQ','VOO','VTI','IWM','DIA'
 ]
+SAFE_ASSETS = {
+    'SPY','VOO','VTI','QQQ','IWM','DIA','SCHB','ITOT','VT',
+    'SCHX','SCHA','SCHM','VB','VO','VV','MGC','MGK','MGV',
+    'BND','AGG','TLT','IEF','SHY','VCIT','LQD','BNDX',
+    'VCSH','VGSH','VGIT','VGLT','BSV','BIV','BLV',
+    'MUB','HYG','JNK','EMB','TIP','SCHZ',
+    'SPAXX','FDRXX','VMFXX','SGOV','BIL','SHV','CLTL',
+    'GBIL','TFLO','ICSH','NEAR',
+}
 QUOTE_CACHE = {}
 QUOTE_TTL_SECONDS = 60
 USE_YAHOO = (os.getenv('USE_YAHOO', '0') == '1')
@@ -101,44 +153,25 @@ NOTIFICATIONS = []
 def generate_history(total_value: float, days: int = 180):
     series = []
     base = float(total_value or 0)
+    rng = __import__('random').Random(42)  # fixed seed = same output every time
     for i in range(days):
         t = i / max(days - 1, 1)
         drift = (t - 0.5) * 0.08 * base
-        noise = (os.urandom(1)[0] / 255.0 - 0.5) * 0.02 * base
+        noise = (rng.random() - 0.5) * 0.02 * base  # deterministic now
         val = max(0, base + drift + noise)
         day = datetime.now() - timedelta(days=(days - 1 - i))
-        series.append({
-            'date': day.strftime('%Y-%m-%d'),
-            'value': round(val, 2)
-        })
+        series.append({'date': day.strftime('%Y-%m-%d'), 'value': round(val, 2)})
     return series
 
-
 def get_account_id():
-    """Get the first account ID for the user"""
+    """Get account ID from JSON export"""
     try:
-        user = get_current_user()
-        if not user:
+        export = _load_full_export()
+        if not export:
             return None
-        
-        # Try to get from stored account data first
-        account_data = load_account_data()
-        user_accounts = account_data.get(user['username'], {}).get('accounts', [])
-        if user_accounts and len(user_accounts) > 0:
-            return user_accounts[0].get('id')
-        
-        # Otherwise fetch from Snaptrade
-        user_id, user_secret = get_user_credentials()
-        if not user_id or not user_secret:
-            return None
-        
-        snaptrade_client = get_snaptrade_client()
-        accounts_response = snaptrade_client.account_information.list_user_accounts(
-            user_id=user_id,
-            user_secret=user_secret
-        )
-        if accounts_response.body:
-            return accounts_response.body[0]['id']
+        accounts = export.get("accounts", [])
+        if accounts:
+            return accounts[0].get("account", {}).get("id")
         return None
     except Exception as e:
         print(f"Error getting account ID: {e}")
@@ -146,26 +179,101 @@ def get_account_id():
 
 
 def get_portfolio_positions():
-    """Get all positions for the user's account"""
+    """
+    Get positions from JSON export.
+    Since this is a day-trading account, positions[] is empty.
+    We reconstruct current holdings from activities (net units > 0).
+    """
     try:
-        account_id = get_account_id()
-        if not account_id:
+        export = _load_full_export()
+        if not export:
             return []
 
-        user_id, user_secret = get_user_credentials()
-        if not user_id or not user_secret:
-            return []
+        # Collect all activities across all accounts
+        symbol_map = {}  # symbol -> {units, total_cost, description, price}
 
-        snaptrade_client = get_snaptrade_client()
-        positions_response = snaptrade_client.account_information.get_user_account_positions(
-            user_id=user_id,
-            user_secret=user_secret,
-            account_id=account_id
-        )
-        return positions_response.body if positions_response.body else []
+        for acc_wrapper in export.get("accounts", []):
+            activities = acc_wrapper.get("activities", {})
+            txns = activities.get("data", []) if isinstance(activities, dict) else []
+
+            for txn in txns:
+                sym_obj = txn.get("symbol") or {}
+                if not isinstance(sym_obj, dict):
+                    continue
+                symbol = sym_obj.get("symbol") or sym_obj.get("raw_symbol")
+                if not symbol:
+                    continue
+
+                units = float(txn.get("units") or 0)   # negative for SELLs
+                price = float(txn.get("price") or 0)
+                description = sym_obj.get("description", symbol)
+
+                if symbol not in symbol_map:
+                    symbol_map[symbol] = {
+                        "symbol": symbol,
+                        "description": description,
+                        "units": 0.0,
+                        "total_cost": 0.0,
+                        "last_price": price,
+                    }
+
+                symbol_map[symbol]["units"] += units
+                if units > 0:  # BUY — add to cost basis
+                    symbol_map[symbol]["total_cost"] += units * price
+                if price > 0:
+                    symbol_map[symbol]["last_price"] = price
+
+        # Only return symbols where net units > 0 (still holding)
+        positions = []
+        for sym, data in symbol_map.items():
+            net_units = round(data["units"], 6)
+            if net_units > 0.0001:
+                avg_cost = data["total_cost"] / net_units if net_units else 0
+                positions.append({
+                    "symbol": sym,
+                    "units": net_units,
+                    "price": data["last_price"],
+                    "average_purchase_price": avg_cost,
+                    "description": data["description"],
+                })
+
+        return positions
+
     except Exception as e:
-        print(f"Error getting positions: {e}")
+        print(f"Error getting positions from export: {e}")
         return []
+
+
+@app.route('/api/accounts', methods=['GET'])
+def get_accounts():
+    """Get accounts from JSON export"""
+    try:
+        if not get_current_user():
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        export = _load_full_export()
+        if not export:
+            return jsonify({'success': True, 'data': []})
+
+        accounts = []
+        for acc_wrapper in export.get("accounts", []):
+            account = acc_wrapper.get("account", {})
+            balances = acc_wrapper.get("balances", [{}])
+            bal = balances[0] if balances else {}
+            accounts.append({
+                "id": account.get("id"),
+                "name": account.get("name"),
+                "number": account.get("number"),
+                "institution_name": account.get("institution_name"),
+                "cash": bal.get("cash", 0),
+                "buying_power": bal.get("buying_power", 0),
+                "currency": bal.get("currency", {}).get("code", "USD"),
+                "is_paper": account.get("is_paper", False),
+            })
+
+        return jsonify({'success': True, 'data': accounts})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/api/portfolio/positions', methods=['GET'])
@@ -226,7 +334,8 @@ def get_portfolio_summary():
                     'quantity': quantity,
                     'marketValue': market_value,
                     'costBasis': cost_basis,
-                    'change': ((current_price - avg_cost) / avg_cost * 100) if avg_cost > 0 else 0
+                    'change': ((current_price - avg_cost) / avg_cost * 100) if avg_cost > 0 else 0,
+                    'isSafeAsset': isinstance(norm_symbol, str) and norm_symbol in SAFE_ASSETS,  # fixed
                 })
 
         total_gain_loss = total_value - total_cost
@@ -332,39 +441,37 @@ def complete_setup():
     try:
         data = request.get_json()
         username = data.get('username', '').strip()
-        
+ 
         if not username:
             return jsonify({'success': False, 'error': 'Username is required'}), 400
-        
+ 
         users = load_users()
         user = users.get(username)
-        
+ 
         if not user:
             return jsonify({'success': False, 'error': 'User not found'}), 404
-        
-        user_id = user.get('snaptrade_user_id')
+ 
+        user_id     = user.get('snaptrade_user_id')
         user_secret = user.get('snaptrade_user_secret')
-        
+ 
         if not user_id or not user_secret:
             return jsonify({'success': False, 'error': 'Invalid user credentials'}), 400
-        
-        # Fetch account information from Snaptrade
+ 
+        # ── existing: fetch account list from SnapTrade ───────────────────────
         snaptrade_client = get_snaptrade_client()
         try:
             accounts_response = snaptrade_client.account_information.list_user_accounts(
                 user_id=user_id,
                 user_secret=user_secret
             )
-            
             if not accounts_response.body:
-                return jsonify({'success': False, 'error': 'No accounts found. Please connect your brokerage account first.'}), 400
-            
+                return jsonify({'success': False,
+                                'error': 'No accounts found. Please connect your brokerage account first.'}), 400
             accounts = accounts_response.body
-            
         except Exception as e:
             return jsonify({'success': False, 'error': f'Failed to fetch accounts: {str(e)}'}), 500
-        
-        # Fetch detailed account information for the first account
+ 
+        # ── existing: store light account data to JSON file ───────────────────
         if len(accounts) > 0:
             account_id = accounts[0].get('id')
             try:
@@ -379,8 +486,7 @@ def complete_setup():
                 account_details = accounts[0]
         else:
             account_details = None
-        
-        # Store account data
+ 
         account_data = load_account_data()
         account_data[username] = {
             'username': username,
@@ -389,18 +495,27 @@ def complete_setup():
             'fetched_at': datetime.now().isoformat()
         }
         save_account_data(account_data)
-        
-        # Update user status
+ 
         users[username]['account_connected'] = True
         users[username]['accounts_fetched_at'] = datetime.now().isoformat()
         save_users(users)
-        
+ 
+        # ── NEW: populate SQLite DB via ORM ───────────────────────────────────
+        # Runs in the same process; errors are non-fatal so setup still succeeds.
+        try:
+            print("[complete_setup] Syncing export to DB...")
+            stats = sync_export_to_db(verbose=True)
+            print(f"[complete_setup] DB sync complete: {stats}")
+        except Exception as db_err:
+            print(f"[complete_setup] ⚠️ DB sync failed (non-fatal): {db_err}")
+        # ─────────────────────────────────────────────────────────────────────
+ 
         return jsonify({
             'success': True,
             'message': 'Account setup completed successfully',
             'accounts': accounts
         })
-        
+ 
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -459,45 +574,6 @@ def auth_status():
         'success': True,
         'logged_in': False
     })
-
-@app.route('/api/accounts', methods=['GET'])
-def get_accounts():
-    """Get user accounts"""
-    try:
-        user = get_current_user()
-        if not user:
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-        
-        # Try to get from stored account data first
-        account_data = load_account_data()
-        user_accounts = account_data.get(user['username'], {}).get('accounts', [])
-        
-        if user_accounts:
-            return jsonify({
-                'success': True,
-                'data': user_accounts
-            })
-        
-        # Otherwise fetch from Snaptrade
-        user_id, user_secret = get_user_credentials()
-        if not user_id or not user_secret:
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-        
-        snaptrade_client = get_snaptrade_client()
-        accounts_response = snaptrade_client.account_information.list_user_accounts(
-            user_id=user_id,
-            user_secret=user_secret
-        )
-
-        return jsonify({
-            'success': True,
-            'data': accounts_response.body if accounts_response.body else []
-        })
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
 
 def _format_transaction_type(activity):
     """Format transaction type for better display"""
@@ -607,6 +683,7 @@ def _parse_transaction_description(description, symbol):
         price_match = match.group(1)
     
     return action, price_match
+
 
 def _to_float(value, default=0.0):
     try:
@@ -1031,6 +1108,7 @@ def get_transactions():
             'data': []
         })
 
+
 @app.route('/api/portfolio/stocks', methods=['GET'])
 def get_portfolio_stocks():
     """Get list of all stocks in portfolio for filtering"""
@@ -1080,7 +1158,8 @@ def get_portfolio_history():
         use_daily = request.args.get('daily', 'true').lower() == 'true'
         selected_symbols = request.args.get('symbols', '').split(',') if request.args.get('symbols') else []
         selected_symbols = [s.strip().upper() for s in selected_symbols if s.strip()]
-        
+        risk_only = request.args.get('risk_only', 'false').lower() == 'true'
+
         if use_daily:
             try:
                 account_id = get_account_id()
@@ -1089,20 +1168,23 @@ def get_portfolio_history():
                     if positions:
                         end_date = datetime.now()
                         start_date = end_date - timedelta(days=days)
-                        
+
                         if selected_symbols:
                             positions = [p for p in positions if _get_symbol_from_position(p) in selected_symbols]
-                        
+
+                        if risk_only:
+                            positions = [p for p in positions if _get_symbol_from_position(p) not in SAFE_ASSETS]
+
                         daily_values = {}
                         symbol_quantities = {}
-                        
+
                         for position in positions:
                             sym = _get_symbol_from_position(position)
                             if sym and sym != 'N/A':
                                 quantity = position.get('units', 0)
                                 if quantity > 0:
                                     symbol_quantities[sym] = symbol_quantities.get(sym, 0) + quantity
-                        
+
                         for symbol, quantity in symbol_quantities.items():
                             try:
                                 ticker = yf.Ticker(symbol)
@@ -1114,22 +1196,32 @@ def get_portfolio_history():
                                         if date_str not in daily_values:
                                             daily_values[date_str] = 0
                                         daily_values[date_str] += price * quantity
+                                else:
+                                    print(f"[history] {symbol}: yfinance returned empty")
                             except Exception as e:
-                                print(f"Error fetching daily data for {symbol}: {e}")
-                        
+                                print(f"[history] {symbol}: yfinance error — {e}")
+
                         if daily_values:
                             history = [{'date': date, 'value': value} for date, value in sorted(daily_values.items())]
                             return jsonify({'success': True, 'data': history, 'source': 'daily_reconstruction'})
+                        else:
+                            print("[history] daily_values empty — falling back")
             except Exception as e:
-                print(f"Daily reconstruction failed, falling back: {e}")
-        
-        summary = get_portfolio_summary().json
-        total_value = summary.get('data', {}).get('totalValue', 0) if summary else 0
+                print(f"[history] Daily reconstruction failed — {e}")
+
+        # Fallback
+        try:
+            summary_result = get_portfolio_summary()
+            response_obj = summary_result[0] if isinstance(summary_result, tuple) else summary_result
+            summary = response_obj.get_json()
+            total_value = (summary or {}).get('data', {}).get('totalValue', 0)
+        except Exception:
+            total_value = 0
         history = generate_history(total_value, days)
         return jsonify({'success': True, 'data': history})
-        
+
     except Exception as e:
-        print(f"Error in get_portfolio_history: {e}")
+        print(f"[history] OUTER exception: {e}")
         return jsonify({'success': True, 'data': generate_history(10000, 180)})
 
 
@@ -1405,6 +1497,17 @@ def notifications_handler():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/', methods=['GET'])
+def index():
+    """Root info route — the backend is API-only; this just confirms it's up."""
+    return jsonify({
+        'service': 'TradePerformanceVisualizer API',
+        'status': 'running',
+        'note': 'This is an API-only backend. Use the frontends, not this URL directly.',
+        'endpoints': ['/api/health', '/api/explorer/data', '/api/db/accounts']
+    })
+
+
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
@@ -1412,8 +1515,110 @@ def health_check():
         'status': 'healthy',
         'timestamp': datetime.now().isoformat()
     })
+"""
+flask_explorer_routes.py
+────────────────────────
+Paste these routes into your existing app.py (after your imports / helpers).
+
+They serve the snaptrade_full_export.json file produced by
+snaptrade_export_all.py, and expose a trigger endpoint so an admin
+can refresh the export on demand from the UI.
+"""
+
+import subprocess
+import threading
+
+EXPORT_FILE = os.path.join(ACCOUNT_DATA_DIR, "snaptrade_full_export.json")
 
 
+def _load_full_export() -> dict:
+    """Read the full export JSON; return {} if missing or corrupt."""
+    if os.path.exists(EXPORT_FILE):
+        try:
+            with open(EXPORT_FILE, "r") as f:
+                return json.load(f)
+        except Exception as exc:
+            print(f"[explorer] Could not read export file: {exc}")
+    return {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET  /api/explorer/data
+# Returns the entire multi-user export as JSON.
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route("/api/explorer/data", methods=["GET"])
+@require_basic_auth
+def explorer_get_data():
+    # user = get_current_user()
+    # if not user:
+    #     return jsonify({"success": False, "error": "Not authenticated"}), 401
+
+    data = _load_full_export()
+    if not data:
+        return jsonify({
+            "success": False,
+            "error": "No export file found. Run snaptrade_export_all.py first, "
+                     "or hit POST /api/explorer/refresh."
+        }), 404
+
+    return jsonify({"success": True, "data": data})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /api/explorer/refresh
+# Kicks off snaptrade_export_all.py in a background thread.
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route("/api/explorer/refresh", methods=["POST"])
+@require_basic_auth
+def explorer_refresh():
+    user = get_current_user()
+    # if not user:
+        # return jsonify({"success": False, "error": "Not authenticated"}), 401
+
+    def _run():
+        try:
+            subprocess.run(["python", "snaptrade_export_all.py"], timeout=120, check=True)
+            print("[explorer] Export done, syncing to DB...")
+            with app.app_context():
+                sync_export_to_db(verbose=True)
+            print("[explorer] DB sync complete.")
+        except Exception as exc:
+            print(f"[explorer] Refresh/sync failed: {exc}")
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"success": True, "message": "Export + DB sync started in background."})
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /api/explorer/meta
+# Quick metadata: last exported time + list of usernames.
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route("/api/explorer/meta", methods=["GET"])
+@require_basic_auth
+def explorer_meta():
+    # user = get_current_user()
+    # if not user:
+    #     return jsonify({"success": False, "error": "Not authenticated"}), 401
+
+    data = _load_full_export()
+    if not data:
+        return jsonify({"success": True, "data": {"exported_at": None, "users": []}})
+
+    users_meta = [
+        {
+            "username": u.get("username"),
+            "exported_at": u.get("exported_at"),
+            "account_count": len(u.get("accounts", [])),
+        }
+        for u in data.get("users", [])
+    ]
+    return jsonify({
+        "success": True,
+        "data": {
+            "exported_at": data.get("exported_at"),
+            "total_users": data.get("total_users", len(users_meta)),
+            "users": users_meta,
+        },
+    })
 @app.route('/api/export/account-data', methods=['GET'])
 def export_account_data():
     """Export all account data as JSON"""
@@ -1470,7 +1675,136 @@ def export_account_data():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
+# ── PostgreSQL table endpoints ─────────────────────────────────────────────
 
+@app.route("/api/db/positions", methods=["GET"])
+@require_basic_auth
+def db_positions():
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "error": "Not authenticated"}), 401
+    rows = (
+        db.session.query(Position, Account, User)
+        .join(Account, Position.account_id == Account.id)
+        .join(User, Account.user_id == User.id)
+        .all()
+    )
+    return jsonify({"success": True, "data": [
+        {
+            "username": u.username,
+            "account": a.name,
+            "symbol": p.symbol,
+            "description": p.description,
+            "exchange": p.exchange,
+            "asset_type": p.asset_type,
+            "quantity": p.quantity,
+            "price": p.price,
+            "avg_cost": p.avg_cost,
+            "market_value": p.market_value,
+            "open_pnl": p.open_pnl,
+        }
+        for p, a, u in rows
+    ]})
+
+@app.route("/api/db/orders", methods=["GET"])
+@require_basic_auth
+def db_orders():
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "error": "Not authenticated"}), 401
+    rows = (
+        db.session.query(Order, Account, User)
+        .join(Account, Order.account_id == Account.id)
+        .join(User, Account.user_id == User.id)
+        .all()
+    )
+    return jsonify({"success": True, "data": [
+        {
+            "username": u.username,
+            "account": a.name,
+            "symbol": o.symbol,
+            "side": o.side,
+            "order_type": o.order_type,
+            "quantity": o.quantity,
+            "filled_quantity": o.filled_quantity,
+            "price": o.price,
+            "status": o.status,
+            "time_in_force": o.time_in_force,
+            "created_at": o.created_at.isoformat() if o.created_at else None,
+            "filled_at": o.filled_at.isoformat() if o.filled_at else None,
+        }
+        for o, a, u in rows
+    ]})
+
+@app.route("/api/db/activities", methods=["GET"])
+@require_basic_auth
+def db_activities():
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "error": "Not authenticated"}), 401
+    rows = (
+        db.session.query(Activity, Account, User)
+        .join(Account, Activity.account_id == Account.id)
+        .join(User, Account.user_id == User.id)
+        .all()
+    )
+    return jsonify({"success": True, "data": [
+        {
+            "username": u.username,
+            "account": a.name,
+            "trade_date": act.trade_date.isoformat() if act.trade_date else None,
+            "type": act.activity_type,
+            "symbol": act.symbol,
+            "description": act.description,
+            "amount": act.amount,
+            "units": act.units,
+            "price": act.price,
+            "fee": act.fee,
+        }
+        for act, a, u in rows
+    ]})
+
+@app.route("/api/db/accounts", methods=["GET"])
+@require_basic_auth
+def db_accounts():
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "error": "Not authenticated"}), 401
+    rows = (
+        db.session.query(Account, User)
+        .join(User, Account.user_id == User.id)
+        .all()
+    )
+    return jsonify({"success": True, "data": [
+        {
+            "username": u.username,
+            "account_id": a.account_id,
+            "name": a.name,
+            "number": a.number,
+            "institution": a.institution,
+            "type": a.account_type,
+            "status": a.status,
+            "is_paper": a.is_paper,
+            "currency": a.currency,
+            "cash": a.cash,
+            "buying_power": a.buying_power,
+        }
+        for a, u in rows
+    ]})
+
+@app.route("/api/db/sync", methods=["POST"])
+@require_basic_auth
+def db_sync_endpoint():
+    """Manually trigger a DB sync from the existing JSON export."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "error": "Not authenticated"}), 401
+    try:
+        stats = sync_export_to_db(verbose=True)
+        return jsonify({"success": True, "stats": stats})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+        
 if __name__ == '__main__':
     app.run(debug=True, port=5001)
 

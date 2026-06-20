@@ -1,104 +1,82 @@
 # TradePerformanceVisualizer
 
-A full-stack application for visualizing trade performance with a Flask backend and React frontend.
+A full-stack application for visualizing trade performance.
+
+## Components
+
+| Component       | Path             | Port | Deployed | Description                                                      |
+| --------------- | ---------------- | ---- | -------- | ---------------------------------------------------------------- |
+| Backend (Flask) | `backend/`       | 5001 | yes      | REST API for the dashboard + the internal explorer endpoints.   |
+| Dashboard       | `frontend/`      | 3000 | yes      | User-facing React app (session auth).                           |
+| Data explorer   | `data-platform/` | 3001 | no (local-only) | Internal, creators-only React explorer behind HTTP Basic Auth. |
+
+The dashboard and explorer both talk to the single Flask backend on `:5001`.
+The explorer's API (`/api/explorer/*`, `/api/db/*`) lives inside the backend,
+gated by HTTP Basic Auth.
 
 ## Prerequisites
 
-- Python 3.12+ (virtual environment already set up in `backend/venv/`)
-- Node.js and npm (for the React frontend)
+- Python 3.12+
+- Node.js and npm
+
+## Setup
+
+### Backend
+
+```bash
+cd backend
+python3 -m venv venv            # create the virtual environment
+source venv/bin/activate        # macOS/Linux  (venv\Scripts\activate on Windows)
+pip install -r requirements.txt
+```
+
+Secrets and runtime data are **not** committed. On first run the backend
+auto-creates the files it needs; templates are provided:
+
+- `backend/users.example.json` → copy to `backend/users.json`
+- `backend/data-export/account-data.example.json` → copy to `backend/data-export/account-data.json`
 
 ## Running the Application
 
-### Quick Start (Recommended - Auto-starts both backend and frontend)
+### Dashboard + backend (quick start)
 
-1. Navigate to the frontend directory:
-   ```bash
-   cd frontend
-   ```
+```bash
+cd frontend
+npm install        # first time only
+npm run dev        # starts the Flask backend (:5001) then the dashboard (:3000)
+```
 
-2. Install dependencies (if not already installed):
-   ```bash
-   npm install
-   ```
+### Running services separately
 
-3. Start both backend and frontend servers:
-   ```bash
-   npm run dev
-   ```
+**Backend (Flask API):**
 
-   This will:
-   - Start the Flask backend server on `http://localhost:5001`
-   - Wait for the backend to be ready
-   - Start the React frontend on `http://localhost:3000`
-   - Automatically open the frontend in your browser
-
-### Running Services Separately
-
-#### Backend (Flask API)
-
-1. Navigate to the backend directory:
-   ```bash
-   cd backend
-   ```
-
-2. Activate the virtual environment:
-   ```bash
-   source venv/bin/activate  # On macOS/Linux
-   # or
-   venv\Scripts\activate  # On Windows
-   ```
-
-3. Install dependencies (if not already installed):
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. Run the Flask server:
-   ```bash
-   python app.py
-   ```
-
-   The backend will run on `http://localhost:5001`
-
-#### Frontend (React)
-
-1. Navigate to the frontend directory:
-   ```bash
-   cd frontend
-   ```
-
-2. Install dependencies (if not already installed):
-   ```bash
-   npm install
-   ```
-
-3. Start the React development server:
-   ```bash
-   npm start
-   ```
-
-   The frontend will run on `http://localhost:3000` and automatically open in your browser.
-
-### Manual Start (Both Services in Separate Terminals)
-
-If you prefer to run both services in separate terminal windows:
-
-**Terminal 1 - Backend:**
 ```bash
 cd backend
 source venv/bin/activate
-python app.py
+python app.py      # http://localhost:5001
 ```
 
-**Terminal 2 - Frontend:**
+**Dashboard (React):**
+
 ```bash
 cd frontend
-npm start
+npm install        # first time only
+npm start          # http://localhost:3000
+```
+
+**Data explorer (React, local-only):**
+
+```bash
+cd data-platform
+npm install        # first time only
+cp .env.example .env   # first time only (sets PORT=3001)
+npm start          # http://localhost:3001 — requires the backend on :5001
 ```
 
 ## API Endpoints
 
 The backend provides the following endpoints:
+
 - `GET /api/health` - Health check
 - `GET /api/portfolio/summary` - Portfolio summary
 - `GET /api/portfolio/positions` - Portfolio positions
@@ -109,3 +87,5 @@ The backend provides the following endpoints:
 - `GET /api/watchlist/quotes` - Watchlist quotes
 - `GET /api/symbols/quote` - Single symbol quote
 - `GET /api/search` - Search holdings and watchlist
+
+Internal explorer endpoints (HTTP Basic Auth): `/api/explorer/*`, `/api/db/*`.

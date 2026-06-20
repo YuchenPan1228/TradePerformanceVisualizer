@@ -1,9 +1,33 @@
-node_modules/
-frontend/node_modules/
-backend/venv/
-*.pyc
+# OS
+.DS_Store
+
+# Python
+venv/
+venv.old/
 __pycache__/
+*.pyc
 *.cache
-data-export/account-data.json
+*.egg-info/
+
+# Node
+node_modules/
+
+# Build output
+frontend/build/
+data-platform/build/
+
+# Logs
+*.log
+
+# Env & secrets
+.env
+.env.*
+!.env.example
 backend/users.json
-backend/venv/
+backend/cookies.txt
+backend/TEST_ACCOUNT.txt
+
+# Generated / runtime data (keep *.example.json templates)
+backend/data-export/*.json
+!backend/data-export/*.example.json
+data-export/*.json

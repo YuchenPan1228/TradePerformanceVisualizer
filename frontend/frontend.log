@@ -1,8 +1,0 @@
-nohup: ignoring input
- INFO  Accepting connections at http://localhost:3000
- HTTP  2/12/2026 1:56:18 AM 128.84.127.190 GET /
- HTTP  2/12/2026 1:56:18 AM 128.84.127.190 Returned 304 in 47 ms
- HTTP  2/12/2026 1:56:19 AM 128.84.127.190 GET /static/css/main.7826101e.css
- HTTP  2/12/2026 1:56:19 AM 128.84.127.190 Returned 304 in 2 ms
- HTTP  2/12/2026 1:56:19 AM 128.84.127.190 GET /static/js/main.46d1f110.js
- HTTP  2/12/2026 1:56:19 AM 128.84.127.190 Returned 304 in 1 ms

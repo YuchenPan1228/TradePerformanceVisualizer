@@ -1,9 +1,7 @@
-// frontend/src/components/Login.jsx
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import axios from 'axios';
 
 const API_URL = '/api';
-
 
 const Login = ({ onLogin }) => {
   const [isLogin, setIsLogin] = useState(true);
@@ -11,25 +9,8 @@ const Login = ({ onLogin }) => {
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
-  const [registrationStep, setRegistrationStep] = useState('initial'); // 'initial', 'connecting', 'completed'
+  const [registrationStep, setRegistrationStep] = useState('initial');
   const [connectionUrl, setConnectionUrl] = useState('');
-
-  useEffect(() => {
-    checkAuthStatus();
-  }, []);
-
-  const checkAuthStatus = async () => {
-    try {
-      const { data } = await axios.get(`${API_URL}/auth/status`, {
-        withCredentials: true
-      });
-      if (data.success && data.logged_in) {
-        onLogin(data.username);
-      }
-    } catch (err) {
-      console.error('Error checking auth status:', err);
-    }
-  };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -38,7 +19,6 @@ const Login = ({ onLogin }) => {
 
     try {
       if (isLogin) {
-        // Login
         const { data } = await axios.post(
           `${API_URL}/auth/login`,
           { username, password },
@@ -50,7 +30,6 @@ const Login = ({ onLogin }) => {
           setError(data.error || 'Login failed');
         }
       } else {
-        // Register - Step 1: Create user and register with Snaptrade
         const { data } = await axios.post(
           `${API_URL}/auth/register`,
           {
@@ -60,14 +39,11 @@ const Login = ({ onLogin }) => {
           },
           { withCredentials: true }
         );
-        
-        
+
         if (data.success) {
           setError('');
           setRegistrationStep('connecting');
           setConnectionUrl(data.redirectURI);
-          
-          // Auto-open the connection URL in a new window
           window.open(data.redirectURI, '_blank', 'width=800,height=600');
         } else {
           setError(data.error || 'Registration failed');
@@ -88,13 +64,12 @@ const Login = ({ onLogin }) => {
   const handleConnectionComplete = async () => {
     setLoading(true);
     try {
-      // Fetch and store account data
       const { data } = await axios.post(
         `${API_URL}/auth/complete-setup`,
         { username },
         { withCredentials: true }
       );
-      
+
       if (data.success) {
         alert('Account setup completed successfully! Please login.');
         setRegistrationStep('initial');
@@ -122,13 +97,13 @@ const Login = ({ onLogin }) => {
               A window has been opened for you to connect your brokerage account.
             </p>
           </div>
-          
+
           <div className="bg-white shadow sm:rounded-lg p-6 space-y-4">
             <div className="text-center">
               <p className="text-sm text-gray-700 mb-4">
                 Complete the authentication in the opened window, then click the button below.
               </p>
-              
+
               <a
                 href={connectionUrl}
                 target="_blank"
@@ -138,13 +113,13 @@ const Login = ({ onLogin }) => {
                 Open connection window again
               </a>
             </div>
-            
+
             {error && (
               <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded text-sm">
                 {error}
               </div>
             )}
-            
+
             <button
               onClick={handleConnectionComplete}
               disabled={loading}
@@ -152,7 +127,7 @@ const Login = ({ onLogin }) => {
             >
               {loading ? 'Completing setup...' : 'I\'ve connected my account'}
             </button>
-            
+
             <button
               onClick={() => {
                 setRegistrationStep('initial');
@@ -200,14 +175,14 @@ const Login = ({ onLogin }) => {
             )}
           </p>
         </div>
-        
+
         <form className="mt-8 space-y-6" onSubmit={handleSubmit}>
           {error && (
             <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded text-sm">
               {error}
             </div>
           )}
-          
+
           <div className="rounded-md shadow-sm -space-y-px">
             <div>
               <label htmlFor="username" className="sr-only">

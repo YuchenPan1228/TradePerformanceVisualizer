@@ -1,9 +1,142 @@
-import React, { useState, useEffect, useMemo } from 'react';
-import { Search, Menu, Bell, Moon, LogOut } from 'lucide-react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { Search, Menu, Bell, Moon, LogOut, ChevronDown, User } from 'lucide-react';
 import axios from 'axios';
 import Login from './Login';
 
 const API_URL = '/api';
+
+const CHART_TIMEFRAMES = [
+  { value: 10, label: '10D' },
+  { value: 30, label: '1M' },
+  { value: 90, label: '3M' },
+  { value: 180, label: '6M' },
+  { value: 365, label: '1Y' },
+  { value: 'all', label: 'All' },
+];
+
+const parseChartDate = (value) => {
+  if (value instanceof Date) return value;
+  const text = String(value || '');
+  const match = text.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (match) {
+    const [, year, month, day] = match;
+    return new Date(Number(year), Number(month) - 1, Number(day));
+  }
+  return new Date(text);
+};
+
+const getValueAtDate = (data, targetDate) => {
+  const target = targetDate.getTime();
+  const sorted = [...data].sort((a, b) => a.date - b.date);
+  for (let i = 0; i < sorted.length; i++) {
+    if (sorted[i].date.getTime() >= target) {
+      if (i === 0) return sorted[0].value;
+      const prev = sorted[i - 1];
+      const curr = sorted[i];
+      const span = curr.date.getTime() - prev.date.getTime();
+      if (!span) return curr.value;
+      const ratio = (target - prev.date.getTime()) / span;
+      return prev.value + (curr.value - prev.value) * ratio;
+    }
+  }
+  return sorted[sorted.length - 1]?.value || 0;
+};
+
+const formatProfileDate = (value) => {
+  if (!value) return '—';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value).slice(0, 10);
+  return date.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+};
+
+const getUserInitials = (name) => {
+  const text = String(name || '').trim();
+  if (!text) return 'U';
+  const parts = text.split(/\s+/).filter(Boolean);
+  if (parts.length >= 2) return `${parts[0][0]}${parts[1][0]}`.toUpperCase();
+  return text.slice(0, 2).toUpperCase();
+};
+
+const PIE_COLORS = [
+  '#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6',
+  '#ec4899', '#14b8a6', '#6366f1', '#84cc16', '#f97316',
+];
+
+const polarToCartesian = (cx, cy, radius, angleDeg) => {
+  const rad = (angleDeg * Math.PI) / 180;
+  return { x: cx + radius * Math.cos(rad), y: cy + radius * Math.sin(rad) };
+};
+
+const describePieSlice = (cx, cy, radius, startAngle, endAngle) => {
+  if (endAngle - startAngle >= 359.99) {
+    return `M ${cx - radius} ${cy} A ${radius} ${radius} 0 1 1 ${cx + radius} ${cy} A ${radius} ${radius} 0 1 1 ${cx - radius} ${cy} Z`;
+  }
+  const start = polarToCartesian(cx, cy, radius, endAngle);
+  const end = polarToCartesian(cx, cy, radius, startAngle);
+  const largeArc = endAngle - startAngle > 180 ? 1 : 0;
+  return `M ${cx} ${cy} L ${start.x} ${start.y} A ${radius} ${radius} 0 ${largeArc} 0 ${end.x} ${end.y} Z`;
+};
+
+const groupAllocationEntries = (entries, maxSlices = 8) => {
+  const sorted = entries
+    .filter((entry) => entry.value > 0)
+    .sort((a, b) => b.value - a.value);
+  if (sorted.length <= maxSlices) return sorted;
+  const kept = sorted.slice(0, maxSlices - 1);
+  const otherValue = sorted.slice(maxSlices - 1).reduce((sum, entry) => sum + entry.value, 0);
+  if (otherValue > 0) kept.push({ label: 'Other', value: otherValue });
+  return kept;
+};
+
+const buildPieSlices = (entries, maxSlices = 8) => {
+  const grouped = groupAllocationEntries(entries, maxSlices);
+  const total = grouped.reduce((sum, entry) => sum + entry.value, 0);
+  if (!total) return [];
+
+  let angle = -90;
+  return grouped.map((entry, index) => {
+    const sweep = (entry.value / total) * 360;
+    const startAngle = angle;
+    const endAngle = angle + sweep;
+    angle = endAngle;
+    return {
+      ...entry,
+      color: PIE_COLORS[index % PIE_COLORS.length],
+      percent: (entry.value / total) * 100,
+      path: describePieSlice(100, 100, 78, startAngle, endAngle),
+    };
+  });
+};
+
+const AllocationPieChart = ({ slices }) => {
+  if (!slices.length) {
+    return <div className="text-sm text-gray-500 text-center py-8">No allocation data</div>;
+  }
+
+  return (
+    <div className="flex flex-col items-center gap-4">
+      <svg viewBox="0 0 200 200" className="w-44 h-44">
+        {slices.map((slice, index) => (
+          <path key={`${slice.label}-${index}`} d={slice.path} fill={slice.color} stroke="#fff" strokeWidth="1.5" />
+        ))}
+      </svg>
+      <div className="w-full space-y-2">
+        {slices.map((slice, index) => (
+          <div key={`${slice.label}-${index}`} className="flex items-center justify-between text-sm">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{ backgroundColor: slice.color }} />
+              <span className="text-gray-700 truncate">{slice.label}</span>
+            </div>
+            <div className="text-right flex-shrink-0 ml-2">
+              <span className="font-medium text-gray-900">{slice.percent.toFixed(1)}%</span>
+              <span className="text-gray-500 ml-2">${slice.value.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
 
 const PortfolioDashboard = () => {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -14,7 +147,6 @@ const PortfolioDashboard = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [growthData, setGrowthData] = useState([]);
-  const [watchlist, setWatchlist] = useState([]);
   const [watchlistQuotes, setWatchlistQuotes] = useState([]);
   const [watchlistIndex, setWatchlistIndex] = useState(0);
 
@@ -39,6 +171,11 @@ const PortfolioDashboard = () => {
   const [selectedStocks, setSelectedStocks] = useState(new Set());
   const [showStockFilter, setShowStockFilter] = useState(false);
   const [hoveredPoint, setHoveredPoint] = useState(null);
+  const [allocationView, setAllocationView] = useState('stock');
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
+  const [userProfile, setUserProfile] = useState(null);
+  const [profileLoading, setProfileLoading] = useState(false);
+  const accountMenuRef = useRef(null);
 
   useEffect(() => {
     checkAuthStatus();
@@ -47,11 +184,43 @@ const PortfolioDashboard = () => {
   useEffect(() => {
     if (isAuthenticated) {
       const initFetch = async () => {
-        await Promise.all([fetchPortfolioData(), fetchTransactions(), fetchWatchlist(), fetchPortfolioHistory(), fetchPortfolioStocks()]);
+        await Promise.all([fetchPortfolioData(), fetchTransactions(), fetchWatchlist()]);
+        await fetchPortfolioStocks();
+        await fetchPortfolioHistory();
       };
       initFetch();
     }
   }, [isAuthenticated]);
+
+  useEffect(() => {
+    const handleClickOutside = (event) => {
+      if (accountMenuRef.current && !accountMenuRef.current.contains(event.target)) {
+        setAccountMenuOpen(false);
+      }
+    };
+    if (accountMenuOpen) {
+      document.addEventListener('mousedown', handleClickOutside);
+    }
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [accountMenuOpen]);
+
+  const fetchUserProfile = async () => {
+    setProfileLoading(true);
+    try {
+      const { data } = await axios.get(`${API_URL}/auth/profile`, { withCredentials: true });
+      if (data.success) setUserProfile(data.data);
+    } catch (err) {
+      console.error('Error fetching user profile:', err);
+    } finally {
+      setProfileLoading(false);
+    }
+  };
+
+  const toggleAccountMenu = () => {
+    const nextOpen = !accountMenuOpen;
+    setAccountMenuOpen(nextOpen);
+    if (nextOpen) fetchUserProfile();
+  };
 
   const checkAuthStatus = async () => {
     try {
@@ -77,6 +246,8 @@ const PortfolioDashboard = () => {
       await axios.post(`${API_URL}/auth/logout`, {}, { withCredentials: true });
       setIsAuthenticated(false);
       setUsername('');
+      setUserProfile(null);
+      setAccountMenuOpen(false);
     } catch (err) {
       console.error('Error logging out:', err);
     }
@@ -116,7 +287,10 @@ const PortfolioDashboard = () => {
         withCredentials: true
       });
       if (data.success && data.data) {
-        const series = data.data.map(item => ({ date: new Date(item.date), value: Number(item.value) || 0 }));
+        const series = data.data.map(item => ({
+          date: parseChartDate(item.date),
+          value: Number(item.value) || 0
+        }));
         setGrowthData(series);
       }
     } catch (err) {
@@ -132,7 +306,10 @@ const PortfolioDashboard = () => {
         withCredentials: true
       });
       if (data.success && data.data) {
-        const series = data.data.map(item => ({ date: new Date(item.date), value: Number(item.value) || 0 }));
+        const series = data.data.map(item => ({
+          date: parseChartDate(item.date),
+          value: Number(item.value) || 0
+        }));
         setBenchmarkData(series);
       }
     } catch (err) {
@@ -163,7 +340,6 @@ const PortfolioDashboard = () => {
     try {
       const { data } = await axios.get(`${API_URL}/watchlist`, { withCredentials: true });
       if (data.success) {
-        setWatchlist(data.data || []);
         await fetchWatchlistQuotes(data.data || []);
       }
     } catch (err) {
@@ -266,8 +442,13 @@ const PortfolioDashboard = () => {
       const type = tx.type || '';
       const isOptionRelated = Boolean(tx.isOption) || type.includes('OPTIONEXERCISE') || type.includes('OPTRD');
       if (transactionView === 'options') {
-        // Options tab = brokerage option orders only (matches SnapTrade orders export), not activities/fills.
-        return tx.source === 'order' && tx.type === 'OPTION_ORDER';
+        // Options tab = SnapTrade option orders only (not activities/fills/exercises).
+        if (tx.source !== 'order' || tx.type !== 'OPTION_ORDER') return false;
+        const filledQty = Number(tx.filledQuantity ?? tx.quantity ?? tx.contractCount ?? 0);
+        const status = (tx.status || '').toUpperCase();
+        const isActive = ['PENDING', 'OPEN', 'NEW', 'ACCEPTED', 'QUEUED', 'WORKING', 'PARTIALLY_FILLED', 'PARTIAL'].includes(status);
+        if (filledQty <= 0 && !isActive) return false;
+        return true;
       }
       return !isOptionRelated;
     });
@@ -349,6 +530,43 @@ const PortfolioDashboard = () => {
     return Array.from(symbols).sort();
   };
 
+  const allocationSlices = useMemo(() => {
+    const holdings = portfolioData?.holdings || [];
+    const cashBalance = portfolioData?.cashBalance || 0;
+    if (!holdings.length && cashBalance <= 0) return [];
+
+    if (allocationView === 'stock') {
+      const entries = holdings.map((holding) => ({
+        label: holding.symbol,
+        value: holding.marketValue,
+      }));
+      if (cashBalance > 0) entries.push({ label: 'Cash', value: cashBalance });
+      return buildPieSlices(entries);
+    }
+
+    if (allocationView === 'asset') {
+      const buckets = {};
+      holdings.forEach((holding) => {
+        const key = holding.assetType || 'Other';
+        buckets[key] = (buckets[key] || 0) + holding.marketValue;
+      });
+      if (cashBalance > 0) buckets.Cash = (buckets.Cash || 0) + cashBalance;
+      return buildPieSlices(
+        Object.entries(buckets).map(([label, value]) => ({ label, value }))
+      );
+    }
+
+    const buckets = {};
+    holdings.forEach((holding) => {
+      const key = holding.sector || 'Unknown';
+      buckets[key] = (buckets[key] || 0) + holding.marketValue;
+    });
+    if (cashBalance > 0) buckets.Cash = (buckets.Cash || 0) + cashBalance;
+    return buildPieSlices(
+      Object.entries(buckets).map(([label, value]) => ({ label, value }))
+    );
+  }, [portfolioData, allocationView]);
+
   // ── Early-return states ──────────────────────────────────────────────────────
   if (checkingAuth) {
     return (
@@ -406,8 +624,8 @@ const PortfolioDashboard = () => {
   const normalizeBenchmark = (portfolioData, benchmarkData) => {
     if (!portfolioData?.length || !benchmarkData?.length) return benchmarkData;
     const portfolioFirst = portfolioData[0].value;
-    const benchmarkFirst = benchmarkData[0].value;
-    if (!portfolioFirst || !benchmarkFirst || benchmarkFirst === 0) return benchmarkData;
+    const benchmarkFirst = getValueAtDate(benchmarkData, portfolioData[0].date);
+    if (!portfolioFirst || !benchmarkFirst) return benchmarkData;
     const scale = portfolioFirst / benchmarkFirst;
     return benchmarkData.map(d => ({ ...d, value: d.value * scale }));
   };
@@ -506,22 +724,17 @@ const PortfolioDashboard = () => {
       return <div className="bg-white rounded-2xl p-6 shadow-sm"><div className="text-center py-12 text-gray-500">No data available</div></div>;
     }
 
-    const getValueAtDate = (data, date) => {
-      const sorted = [...data].sort((a, b) => a.date - b.date);
-      for (let i = 0; i < sorted.length; i++) {
-        if (sorted[i].date.getTime() >= date) {
-          if (i === 0) return sorted[0].value;
-          const prev = sorted[i - 1], curr = sorted[i];
-          const ratio = (date - prev.date.getTime()) / (curr.date.getTime() - prev.date.getTime());
-          return prev.value + (curr.value - prev.value) * ratio;
-        }
-      }
-      return sorted[sorted.length - 1]?.value || 0;
-    };
+    const getValueAtDateLocal = (data, date) => getValueAtDate(data, new Date(date));
 
-    const portfolioSeries = allDates.map(date => ({ date: new Date(date), value: getValueAtDate(portfolioPoints, date) }));
+    const portfolioSeries = allDates.map(date => ({
+      date: new Date(date),
+      value: getValueAtDateLocal(portfolioPoints, date)
+    }));
     const benchmarkSeries = benchmarkPoints.length > 0
-      ? allDates.map(date => ({ date: new Date(date), value: getValueAtDate(benchmarkPoints, date) }))
+      ? allDates.map(date => ({
+        date: new Date(date),
+        value: getValueAtDateLocal(benchmarkPoints, date)
+      }))
       : [];
 
     const allValues = [
@@ -551,8 +764,8 @@ const PortfolioDashboard = () => {
     const portfolioReturn = firstPortfolio ? ((lastPortfolio - firstPortfolio) / Math.abs(firstPortfolio)) * 100 : 0;
 
     const metrics = calculatePerformanceMetrics(
-      (growthData || []).map(p => ({ date: typeof p.date === 'string' ? new Date(p.date) : p.date, value: p.value })),
-      (benchmarkData || []).map(p => ({ date: typeof p.date === 'string' ? new Date(p.date) : p.date, value: p.value }))
+      (growthData || []).map(p => ({ date: parseChartDate(p.date), value: p.value })),
+      (benchmarkData || []).map(p => ({ date: parseChartDate(p.date), value: p.value }))
     );
 
     const formatYValue = (val) => yAxisType === 'return'
@@ -671,14 +884,16 @@ const PortfolioDashboard = () => {
               return (
                 <g key={i}>
                   <rect x={x - 10} y={padding} width={20} height={height - padding * 2} fill="transparent" style={{ cursor: 'crosshair' }}
-                    onMouseEnter={(e) => {
-                      const rect = e.currentTarget.getBoundingClientRect();
-                      const svgRect = e.currentTarget.ownerSVGElement.getBoundingClientRect();
-                      const svgX = (rect.left + rect.width / 2 - svgRect.left) / (svgRect.width / width);
-                      const svgY = (rect.top + rect.height / 2 - svgRect.top) / (svgRect.height / height);
-                      setHoveredPoint({ x: svgX * (svgRect.width / width), y: svgY * (svgRect.height / height), date: point.date, portfolioValue: point.value, benchmarkValue });
+                    onMouseEnter={() => {
+                      setHoveredPoint({
+                        x,
+                        y,
+                        date: point.date,
+                        portfolioValue: point.value,
+                        benchmarkValue
+                      });
                     }} />
-                  {hoveredPoint && Math.abs(hoveredPoint.x - x) < 15 && (
+                  {hoveredPoint && hoveredPoint.date.getTime() === point.date.getTime() && (
                     <>
                       <circle cx={x} cy={y} r={5} fill="#3b82f6" stroke="white" strokeWidth={2} />
                       {benchmarkValue !== undefined && <circle cx={x} cy={sy(benchmarkValue)} r={5} fill="#10b981" stroke="white" strokeWidth={2} />}
@@ -702,6 +917,14 @@ const PortfolioDashboard = () => {
                 const lastDate = portfolioSeries[portfolioSeries.length - 1].date.getTime();
                 const dateRange = lastDate - firstDate;
                 const labels = [], labelIndices = new Set();
+                if (portfolioSeries.length === 1 || dateRange === 0) {
+                  const point = portfolioSeries[0];
+                  return [
+                    <text key={0} x={sx(0)} y={height - padding + 20} textAnchor="middle">
+                      {point.date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+                    </text>
+                  ];
+                }
                 for (let i = 0; i < numLabels; i++) {
                   const targetTime = firstDate + (dateRange * i / (numLabels - 1));
                   let closestIdx = 0, minDiff = Math.abs(portfolioSeries[0].date.getTime() - targetTime);
@@ -726,7 +949,11 @@ const PortfolioDashboard = () => {
 
           {hoveredPoint && (
             <div className="absolute bg-gray-900 text-white px-3 py-2 rounded-lg shadow-lg text-sm pointer-events-none z-10"
-              style={{ left: `${(hoveredPoint.x / width) * 100}%`, top: `${(hoveredPoint.y / height) * 100}%`, transform: 'translate(-50%, -100%)', marginTop: '-10px' }}>
+              style={{
+                left: `${(hoveredPoint.x / width) * 100}%`,
+                top: `${Math.max((hoveredPoint.y / height) * 100 - 8, 0)}%`,
+                transform: 'translate(-50%, -100%)'
+              }}>
               <div className="font-semibold mb-1">
                 {hoveredPoint.date.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })}
               </div>
@@ -757,16 +984,13 @@ const PortfolioDashboard = () => {
           )}
         </div>
 
-        <div className="flex gap-2 mt-6 pt-4 border-t border-gray-200">
-          {[1, 5, 30, 90, 180, 365].map(days => {
-            const labels = { 1: '1D', 5: '5D', 30: '1M', 90: '3M', 180: '6M', 365: '1Y' };
-            return (
-              <button key={days} onClick={() => setTimeframe(days)}
-                className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${timeframe === days ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}>
-                {labels[days] || `${days}D`}
-              </button>
-            );
-          })}
+        <div className="flex flex-wrap gap-2 mt-6 pt-4 border-t border-gray-200">
+          {CHART_TIMEFRAMES.map(({ value, label }) => (
+            <button key={label} onClick={() => setTimeframe(value)}
+              className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${timeframe === value ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}>
+              {label}
+            </button>
+          ))}
         </div>
 
         <div className="mt-6 pt-6 border-t border-gray-200">
@@ -829,14 +1053,103 @@ const PortfolioDashboard = () => {
               <Bell className="w-5 h-5" />
               <span className="absolute top-1 right-1 w-2 h-2 bg-orange-500 rounded-full"></span>
             </button>
-            <div className="flex items-center gap-4">
-              <div className="flex items-center gap-2 cursor-pointer">
-                <div className="w-10 h-10 bg-blue-500 rounded-full"></div>
-                <span className="font-medium">{username}</span>
-              </div>
-              <button onClick={handleLogout} className="p-2 hover:bg-gray-100 rounded-lg" title="Logout">
-                <LogOut className="w-5 h-5" />
+            <div className="relative" ref={accountMenuRef}>
+              <button
+                type="button"
+                onClick={toggleAccountMenu}
+                className="flex items-center gap-2 px-2 py-1.5 rounded-lg hover:bg-gray-100 transition-colors"
+                aria-expanded={accountMenuOpen}
+                aria-haspopup="true"
+              >
+                <div className="w-10 h-10 bg-blue-500 rounded-full flex items-center justify-center text-white text-sm font-semibold">
+                  {getUserInitials(username)}
+                </div>
+                <span className="font-medium text-gray-900 hidden sm:inline">{username}</span>
+                <ChevronDown className={`w-4 h-4 text-gray-500 transition-transform ${accountMenuOpen ? 'rotate-180' : ''}`} />
               </button>
+
+              {accountMenuOpen && (
+                <div className="absolute right-0 mt-2 w-80 bg-white rounded-xl border border-gray-200 shadow-lg z-50 overflow-hidden">
+                  <div className="px-4 py-4 border-b border-gray-100 bg-gradient-to-r from-blue-50 to-white">
+                    <div className="flex items-center gap-3">
+                      <div className="w-12 h-12 bg-blue-500 rounded-full flex items-center justify-center text-white font-semibold">
+                        {getUserInitials(username)}
+                      </div>
+                      <div className="min-w-0">
+                        <div className="font-semibold text-gray-900 truncate">{username}</div>
+                        <div className="text-xs text-gray-500">Member since {formatProfileDate(userProfile?.createdAt)}</div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="px-4 py-3 space-y-3">
+                    {profileLoading ? (
+                      <div className="text-sm text-gray-500 py-4 text-center">Loading account info...</div>
+                    ) : (
+                      <>
+                        <div className="flex items-center gap-2 text-sm font-medium text-gray-900">
+                          <User className="w-4 h-4 text-gray-500" />
+                          Account Details
+                        </div>
+
+                        <div className="space-y-2 text-sm">
+                          <div className="flex justify-between gap-3">
+                            <span className="text-gray-500">Brokerage</span>
+                            <span className="text-gray-900 text-right">{userProfile?.brokerage?.institutionName || '—'}</span>
+                          </div>
+                          <div className="flex justify-between gap-3">
+                            <span className="text-gray-500">Account</span>
+                            <span className="text-gray-900 text-right truncate">{userProfile?.brokerage?.accountName || '—'}</span>
+                          </div>
+                          <div className="flex justify-between gap-3">
+                            <span className="text-gray-500">Account #</span>
+                            <span className="text-gray-900 font-mono text-xs">{userProfile?.brokerage?.accountNumber || '—'}</span>
+                          </div>
+                          <div className="flex justify-between gap-3">
+                            <span className="text-gray-500">Type</span>
+                            <span className="text-gray-900 text-right">
+                              {userProfile?.brokerage?.accountType || '—'}
+                              {userProfile?.brokerage?.isPaper ? ' (Paper)' : ''}
+                            </span>
+                          </div>
+                          <div className="flex justify-between gap-3">
+                            <span className="text-gray-500">Status</span>
+                            <span className={`text-right capitalize ${userProfile?.brokerage?.status === 'open' ? 'text-green-600' : 'text-gray-900'}`}>
+                              {userProfile?.brokerage?.status || (userProfile?.accountConnected ? 'Connected' : 'Not connected')}
+                            </span>
+                          </div>
+                          {userProfile?.brokerage?.balance != null && (
+                            <div className="flex justify-between gap-3">
+                              <span className="text-gray-500">Balance</span>
+                              <span className="text-gray-900 font-medium">
+                                ${userProfile.brokerage.balance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                {userProfile.brokerage.currency ? ` ${userProfile.brokerage.currency}` : ''}
+                              </span>
+                            </div>
+                          )}
+                          <div className="flex justify-between gap-3">
+                            <span className="text-gray-500">Last sync</span>
+                            <span className="text-gray-900 text-right text-xs">
+                              {formatProfileDate(userProfile?.brokerage?.lastHoldingsSync || userProfile?.accountsFetchedAt)}
+                            </span>
+                          </div>
+                        </div>
+                      </>
+                    )}
+                  </div>
+
+                  <div className="px-4 py-3 border-t border-gray-100 bg-gray-50">
+                    <button
+                      type="button"
+                      onClick={handleLogout}
+                      className="w-full flex items-center justify-center gap-2 px-3 py-2 text-sm font-medium text-red-600 hover:bg-red-50 rounded-lg transition-colors"
+                    >
+                      <LogOut className="w-4 h-4" />
+                      Sign out
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -906,6 +1219,8 @@ const PortfolioDashboard = () => {
                   {holdings.map((holding, idx) => {
                     const gainLoss = holding.marketValue - holding.costBasis;
                     const gainLossPercent = holding.costBasis > 0 ? (gainLoss / holding.costBasis) * 100 : 0;
+                    const dailyChange = holding.dailyChange ?? 0;
+                    const dailyGainLoss = holding.dailyGainLoss ?? 0;
                     const avgPrice = holding.costBasis / holding.quantity || 0;
                     return (
                       <div key={idx} className="bg-gradient-to-br from-white to-gray-50 rounded-xl p-6 border border-gray-200 hover:shadow-lg transition-shadow">
@@ -913,8 +1228,8 @@ const PortfolioDashboard = () => {
                           <div className="flex-1">
                             <div className="flex items-center gap-2 mb-1">
                               <div className="font-bold text-gray-900 text-xl">{safeText(holding.symbol)}</div>
-                              <div className={`px-2 py-0.5 rounded text-xs font-medium ${holding.change > 0 ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
-                                {holding.change > 0 ? '+' : ''}{holding.change.toFixed(2)}%
+                              <div className={`px-2 py-0.5 rounded text-xs font-medium ${dailyChange > 0 ? 'bg-green-100 text-green-700' : dailyChange < 0 ? 'bg-red-100 text-red-700' : 'bg-gray-100 text-gray-700'}`}>
+                                {dailyChange > 0 ? '+' : ''}{dailyChange.toFixed(2)}%
                               </div>
                             </div>
                             <div className="text-sm text-gray-600 mb-2">{safeText(holding.name)}</div>
@@ -922,9 +1237,9 @@ const PortfolioDashboard = () => {
                           </div>
                           <div className="text-right ml-4">
                             <div className="font-bold text-gray-900 text-lg">${holding.price.toFixed(2)}</div>
-                            <div className={`text-sm flex items-center gap-1 justify-end mt-1 ${holding.change > 0 ? 'text-green-600' : 'text-red-600'}`}>
-                              <span>{holding.change > 0 ? '↑' : '↓'}</span>
-                              {Math.abs(holding.change).toFixed(2)}%
+                            <div className={`text-sm flex items-center gap-1 justify-end mt-1 ${dailyGainLoss > 0 ? 'text-green-600' : dailyGainLoss < 0 ? 'text-red-600' : 'text-gray-600'}`}>
+                              <span>{dailyGainLoss > 0 ? '↑' : dailyGainLoss < 0 ? '↓' : '—'}</span>
+                              {dailyGainLoss > 0 ? '+' : dailyGainLoss < 0 ? '-' : ''}${Math.abs(dailyGainLoss).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                             </div>
                           </div>
                         </div>
@@ -979,12 +1294,39 @@ const PortfolioDashboard = () => {
                   </div>
                   <div className="text-right">
                     <div className="font-bold text-gray-900">${holding.marketValue.toFixed(2)}</div>
-                    <div className={`text-xs ${holding.change > 0 ? 'text-green-600' : 'text-red-600'}`}>
-                      {holding.change > 0 ? '+' : ''}{holding.change.toFixed(2)}%
+                    <div className={`text-xs ${(holding.dailyChange ?? 0) > 0 ? 'text-green-600' : (holding.dailyChange ?? 0) < 0 ? 'text-red-600' : 'text-gray-600'}`}>
+                      {(holding.dailyChange ?? 0) > 0 ? '+' : ''}{(holding.dailyChange ?? 0).toFixed(2)}% today
                     </div>
                   </div>
                 </div>
               ))}
+            </section>
+
+            <section className="bg-white rounded-2xl p-6 shadow-sm">
+              <div className="flex items-center justify-between gap-3 mb-4">
+                <h3 className="text-xl font-bold text-gray-900">Allocation</h3>
+              </div>
+              <div className="flex rounded-lg border border-gray-200 overflow-hidden text-xs font-medium mb-5">
+                {[
+                  { id: 'stock', label: 'Stocks' },
+                  { id: 'asset', label: 'Assets' },
+                  { id: 'sector', label: 'Sectors' },
+                ].map((option) => (
+                  <button
+                    key={option.id}
+                    type="button"
+                    onClick={() => setAllocationView(option.id)}
+                    className={`flex-1 px-2 py-2 transition-colors ${
+                      allocationView === option.id
+                        ? 'bg-blue-600 text-white'
+                        : 'bg-white text-gray-600 hover:bg-gray-50'
+                    }`}
+                  >
+                    {option.label}
+                  </button>
+                ))}
+              </div>
+              <AllocationPieChart slices={allocationSlices} />
             </section>
 
             <section className="bg-white rounded-2xl p-6 shadow-sm">

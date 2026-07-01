@@ -1,7 +1,5 @@
 import React, { useState } from 'react';
-import axios from 'axios';
-
-const API_URL = '/api';
+import { apiPost } from './api';
 
 const Login = ({ onLogin }) => {
   const [isLogin, setIsLogin] = useState(true);
@@ -19,22 +17,14 @@ const Login = ({ onLogin }) => {
 
     try {
       if (isLogin) {
-        const { data } = await axios.post(
-          `${API_URL}/auth/login`,
-          { username, password },
-          { withCredentials: true }
-        );
+        const data = await apiPost('/auth/login', { username, password });
         if (data.success) {
           onLogin(data.username);
         } else {
           setError(data.error || 'Login failed');
         }
       } else {
-        const { data } = await axios.post(
-          `${API_URL}/auth/register`,
-          { username, password },
-          { withCredentials: true }
-        );
+        const data = await apiPost('/auth/register', { username, password });
 
         if (data.success) {
           setError('');
@@ -60,11 +50,7 @@ const Login = ({ onLogin }) => {
   const handleConnectionComplete = async () => {
     setLoading(true);
     try {
-      const { data } = await axios.post(
-        `${API_URL}/auth/complete-setup`,
-        { username },
-        { withCredentials: true }
-      );
+      const data = await apiPost('/auth/complete-setup', { username });
 
       if (data.success) {
         alert('Account setup completed successfully! Please login.');

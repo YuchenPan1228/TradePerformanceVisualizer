@@ -130,14 +130,36 @@ def get_user_credentials():
     return None, None
 
 
-def _symbol_from_activity(activity):
-    raw = activity.get('symbol')
+def require_session(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not get_current_user():
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+        return f(*args, **kwargs)
+    return decorated
+
+
+def _get_stored_primary_account(username):
+    stored = load_account_data().get(username, {})
+    primary = stored.get('primary_account') or {}
+    accounts = stored.get('accounts') or []
+    if not primary and accounts:
+        primary = accounts[0]
+    return primary
+
+
+def _extract_symbol(obj, default='N/A'):
+    """Extract ticker from a SnapTrade position or activity."""
+    raw = obj.get('symbol')
     if isinstance(raw, dict):
         inner = raw.get('symbol')
         if isinstance(inner, dict):
-            return inner.get('symbol') or inner.get('raw_symbol')
-        return inner or raw.get('raw_symbol')
-    return raw
+            return inner.get('symbol') or inner.get('raw_symbol') or default
+        val = inner or raw.get('raw_symbol')
+        return val if val else default
+    if raw:
+        return str(raw)
+    return default
 
 
 def _load_full_export() -> dict:
@@ -179,7 +201,6 @@ try:
     logging.getLogger('yfinance').setLevel(logging.ERROR)
 except Exception:
     pass
-NOTIFICATIONS = []
 
 
 def _flat_portfolio_history(total_value, chart_start, end_day=None):
@@ -309,7 +330,7 @@ def _build_portfolio_history_from_activities(activities, chart_start, selected_s
 
         cash += _to_float(activity.get('amount', 0), 0.0)
         if not activity.get('option_symbol'):
-            sym = _symbol_from_activity(activity)
+            sym = _extract_symbol(activity, default=None)
             units = _to_float(activity.get('units', activity.get('quantity', 0)), 0.0)
             act_type = (activity.get('type') or '').upper()
             if sym and sym != 'N/A' and units != 0 and act_type in ('BUY', 'SELL', 'JNLS'):
@@ -409,6 +430,12 @@ def _fetch_symbol_daily_closes(symbol, start_date, end_date):
         return {}
 
 
+def _yf_history_points(symbol, start_date, end_date):
+    """Return [{date, value}, ...] from Yahoo daily closes."""
+    closes = _fetch_symbol_daily_closes(symbol, start_date, end_date)
+    return [{'date': day, 'value': price} for day, price in sorted(closes.items())]
+
+
 def get_account_id():
     """Get the primary SnapTrade account ID for the logged-in user."""
     try:
@@ -452,140 +479,116 @@ def get_portfolio_positions():
     return []
 
 
-@app.route('/api/accounts', methods=['GET'])
-def get_accounts():
-    """Get accounts for the logged-in user."""
-    try:
-        if not get_current_user():
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-
-        user = get_current_user()
-        account_data = load_account_data()
-        user_accounts = account_data.get(user['username'], {}).get('accounts', [])
-        if user_accounts:
-            return jsonify({'success': True, 'data': user_accounts})
-
-        user_id, user_secret = get_user_credentials()
-        if not user_id or not user_secret:
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-
-        snaptrade_client = get_snaptrade_client()
-        accounts_response = snaptrade_client.account_information.list_user_accounts(
-            user_id=user_id,
-            user_secret=user_secret,
-        )
-        return jsonify({
-            'success': True,
-            'data': accounts_response.body if accounts_response.body else []
-        })
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-
-@app.route('/api/portfolio/positions', methods=['GET'])
-def get_positions():
-    """Get portfolio positions"""
-    try:
-        if not get_current_user():
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+def _compute_portfolio_summary(positions=None):
+    """Build portfolio summary dict from SnapTrade positions."""
+    if positions is None:
         positions = get_portfolio_positions()
-        return jsonify({
-            'success': True,
-            'data': positions
+
+    total_value = 0
+    total_cost = 0
+    holdings = []
+    position_rows = []
+
+    for position in positions:
+        norm_symbol = _extract_symbol(position)
+        if not norm_symbol or norm_symbol == 'N/A':
+            continue
+
+        current_price = position.get('price', 0)
+        quantity = position.get('units', 0)
+        avg_cost = position.get('average_purchase_price', 0)
+
+        market_value = current_price * quantity
+        cost_basis = avg_cost * quantity
+
+        total_value += market_value
+        total_cost += cost_basis
+
+        position_rows.append({
+            'position': position,
+            'symbol': norm_symbol,
+            'name': _get_name_from_position(position, norm_symbol),
+            'price': current_price,
+            'quantity': quantity,
+            'marketValue': market_value,
+            'costBasis': cost_basis,
         })
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
+
+    symbols = [row['symbol'] for row in position_rows]
+    previous_closes = _fetch_previous_closes(symbols)
+    allocation_metadata = _fetch_allocation_metadata(symbols)
+
+    for row in position_rows:
+        position = row.pop('position')
+        current_price = row['price']
+        quantity = row['quantity']
+        avg_cost = row['costBasis'] / quantity if quantity else 0
+        prev_close = previous_closes.get(row['symbol'])
+        daily_change_percent = 0.0
+        daily_gain_loss = 0.0
+        if prev_close and prev_close > 0:
+            daily_change_percent = ((current_price - prev_close) / prev_close) * 100
+            daily_gain_loss = (current_price - prev_close) * quantity
+
+        meta = allocation_metadata.get(row['symbol'], {})
+        holdings.append({
+            **row,
+            'change': ((current_price - avg_cost) / avg_cost * 100) if avg_cost > 0 else 0,
+            'dailyChange': daily_change_percent,
+            'dailyGainLoss': daily_gain_loss,
+            'assetType': _asset_type_from_position(
+                position, row['symbol'], meta.get('assetType')
+            ),
+            'sector': meta.get('sector') or 'Unknown',
+        })
+
+    account_total = _get_account_total_balance()
+    if account_total is not None:
+        cash_balance = max(0.0, account_total - total_value)
+    else:
+        cached_total = _get_cached_account_balance()
+        cash_balance = max(0.0, cached_total - total_value) if cached_total is not None else 0.0
+
+    total_gain_loss = total_value - total_cost
+    total_return = (total_gain_loss / total_cost * 100) if total_cost > 0 else 0
+
+    return {
+        'totalValue': total_value,
+        'totalCost': total_cost,
+        'totalGainLoss': total_gain_loss,
+        'totalReturn': total_return,
+        'cashBalance': cash_balance,
+        'holdings': holdings,
+    }
+
+
+def _positions_to_stocks(positions):
+    stocks = []
+    seen_symbols = set()
+    for position in positions:
+        sym = _extract_symbol(position)
+        if not sym or sym == 'N/A' or sym in seen_symbols:
+            continue
+        quantity = position.get('units', 0)
+        current_price = position.get('price', 0)
+        stocks.append({
+            'symbol': sym,
+            'name': _get_name_from_position(position, sym),
+            'quantity': quantity,
+            'marketValue': current_price * quantity,
+        })
+        seen_symbols.add(sym)
+    return stocks
 
 
 @app.route('/api/portfolio/summary', methods=['GET'])
+@require_session
 def get_portfolio_summary():
     """Get portfolio summary with total value and performance"""
     try:
-        if not get_current_user():
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-        positions = get_portfolio_positions()
-
-        total_value = 0
-        total_cost = 0
-        holdings = []
-        position_rows = []
-
-        for position in positions:
-            norm_symbol = _get_symbol_from_position(position)
-            if not norm_symbol or norm_symbol == 'N/A':
-                continue
-
-            current_price = position.get('price', 0)
-            quantity = position.get('units', 0)
-            avg_cost = position.get('average_purchase_price', 0)
-
-            market_value = current_price * quantity
-            cost_basis = avg_cost * quantity
-
-            total_value += market_value
-            total_cost += cost_basis
-
-            position_rows.append({
-                'position': position,
-                'symbol': norm_symbol,
-                'name': _get_name_from_position(position, norm_symbol),
-                'price': current_price,
-                'quantity': quantity,
-                'marketValue': market_value,
-                'costBasis': cost_basis,
-            })
-
-        symbols = [row['symbol'] for row in position_rows]
-        previous_closes = _fetch_previous_closes(symbols)
-        allocation_metadata = _fetch_allocation_metadata(symbols)
-
-        for row in position_rows:
-            position = row.pop('position')
-            current_price = row['price']
-            quantity = row['quantity']
-            avg_cost = row['costBasis'] / quantity if quantity else 0
-            prev_close = previous_closes.get(row['symbol'])
-            daily_change_percent = 0.0
-            daily_gain_loss = 0.0
-            if prev_close and prev_close > 0:
-                daily_change_percent = ((current_price - prev_close) / prev_close) * 100
-                daily_gain_loss = (current_price - prev_close) * quantity
-
-            meta = allocation_metadata.get(row['symbol'], {})
-            holdings.append({
-                **row,
-                'change': ((current_price - avg_cost) / avg_cost * 100) if avg_cost > 0 else 0,
-                'dailyChange': daily_change_percent,
-                'dailyGainLoss': daily_gain_loss,
-                'assetType': _asset_type_from_position(
-                    position, row['symbol'], meta.get('assetType')
-                ),
-                'sector': meta.get('sector') or 'Unknown',
-            })
-
-        account_total = _get_account_total_balance()
-        if account_total is not None:
-            cash_balance = max(0.0, account_total - total_value)
-        else:
-            cached_total = _get_cached_account_balance()
-            cash_balance = max(0.0, cached_total - total_value) if cached_total is not None else 0.0
-
-        total_gain_loss = total_value - total_cost
-        total_return = (total_gain_loss / total_cost * 100) if total_cost > 0 else 0
-
         return jsonify({
             'success': True,
-            'data': {
-                'totalValue': total_value,
-                'totalCost': total_cost,
-                'totalGainLoss': total_gain_loss,
-                'totalReturn': total_return,
-                'cashBalance': cash_balance,
-                'holdings': holdings
-            }
+            'data': _compute_portfolio_summary(),
         })
     except Exception as e:
         return jsonify({
@@ -831,13 +834,7 @@ def _build_user_profile(user):
         'brokerage': None,
     }
 
-    account_data = load_account_data()
-    stored = account_data.get(username, {})
-    primary = stored.get('primary_account') or {}
-    accounts = stored.get('accounts') or []
-
-    if not primary and accounts:
-        primary = accounts[0]
+    primary = _get_stored_primary_account(username)
 
     if not primary:
         user_id, user_secret = get_user_credentials()
@@ -881,14 +878,12 @@ def _build_user_profile(user):
 
 
 @app.route('/api/auth/profile', methods=['GET'])
+@require_session
 def auth_profile():
     """Return safe account profile details for the logged-in user."""
-    user = get_current_user()
-    if not user:
-        return jsonify({'success': False, 'error': 'Not authenticated'}), 401
     return jsonify({
         'success': True,
-        'data': _build_user_profile(user),
+        'data': _build_user_profile(get_current_user()),
     })
 
 
@@ -1185,7 +1180,7 @@ def get_transactions():
         option_activity_candidates = []
         if activities_body:
             for activity in activities_body:
-                norm_symbol = _symbol_from_activity(activity) or 'N/A'
+                norm_symbol = _extract_symbol(activity)
                 
                 description = activity.get('description', '')
                 action, price_from_desc = _parse_transaction_description(description, norm_symbol)
@@ -1335,51 +1330,23 @@ def get_transactions():
 
 
 @app.route('/api/portfolio/stocks', methods=['GET'])
+@require_session
 def get_portfolio_stocks():
     """Get list of all stocks in portfolio for filtering"""
     try:
-        if not get_current_user():
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-        positions = get_portfolio_positions()
-        stocks = []
-        seen_symbols = set()
-        
-        for position in positions:
-            sym = _get_symbol_from_position(position)
-            if sym and sym != 'N/A' and sym not in seen_symbols:
-                quantity = position.get('units', 0)
-                current_price = position.get('price', 0)
-                market_value = current_price * quantity
-                
-                name = sym
-                symbol_obj = position.get('symbol')
-                if isinstance(symbol_obj, dict):
-                    inner_symbol = symbol_obj.get('symbol')
-                    if isinstance(inner_symbol, dict):
-                        name = inner_symbol.get('description', symbol_obj.get('description', sym))
-                    else:
-                        name = symbol_obj.get('description', sym)
-                
-                stocks.append({
-                    'symbol': sym,
-                    'name': name,
-                    'quantity': quantity,
-                    'marketValue': market_value
-                })
-                seen_symbols.add(sym)
-        
-        return jsonify({'success': True, 'data': stocks})
+        return jsonify({
+            'success': True,
+            'data': _positions_to_stocks(get_portfolio_positions()),
+        })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/api/portfolio/history', methods=['GET'])
+@require_session
 def get_portfolio_history():
     """Return historical portfolio values from SnapTrade (not pre-trade yfinance guesses)."""
     try:
-        if not get_current_user():
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-
         days_param = request.args.get('days', 30)
         selected_symbols = request.args.get('symbols', '').split(',') if request.args.get('symbols') else []
         selected_symbols = [s.strip().upper() for s in selected_symbols if s.strip()]
@@ -1416,9 +1383,8 @@ def get_portfolio_history():
                     'timeframe': 'all' if show_all else days,
                 })
 
-        summary_response = get_portfolio_summary()
-        summary = summary_response.get_json() if hasattr(summary_response, 'get_json') else {}
-        total_value = summary.get('data', {}).get('totalValue', 0) if summary else 0
+        summary = _compute_portfolio_summary()
+        total_value = summary.get('totalValue', 0)
         history = _flat_portfolio_history(total_value, chart_start, end_day)
         return jsonify({
             'success': True,
@@ -1451,53 +1417,15 @@ def get_benchmark_history():
         else:
             start_date = datetime.combine(chart_start, datetime.min.time())
 
-        try:
-            hist = yf.Ticker(symbol).history(
-                start=start_date,
-                end=end_date + timedelta(days=1),
-                auto_adjust=True,
-                interval='1d'
-            )
-
-            if hist is not None and len(hist) > 0:
-                close_col = 'Close' if 'Close' in hist.columns else 'Adj Close'
-                history = []
-                for date, row in hist.iterrows():
-                    price = row.get(close_col)
-                    if price is None:
-                        continue
-                    try:
-                        price = float(price)
-                    except (TypeError, ValueError):
-                        continue
-                    if price != price:
-                        continue
-                    history.append({
-                        'date': date.strftime('%Y-%m-%d'),
-                        'value': price
-                    })
-
-                if history:
-                    return jsonify({'success': True, 'data': history, 'symbol': symbol})
-        except Exception as e:
-            print(f"Error fetching benchmark data for {symbol}: {e}")
+        history = _yf_history_points(symbol, start_date, end_date)
+        if history:
+            return jsonify({'success': True, 'data': history, 'symbol': symbol})
 
         return jsonify({'success': False, 'error': f'Could not fetch data for {symbol}'}), 500
 
     except Exception as e:
         print(f"Error in get_benchmark_history: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
-
-
-def _get_symbol_from_position(position):
-    """Extract symbol from position object"""
-    sym = position.get('symbol')
-    if isinstance(sym, dict):
-        inner_symbol = sym.get('symbol')
-        if isinstance(inner_symbol, dict):
-            return inner_symbol.get('symbol') or inner_symbol.get('raw_symbol') or 'N/A'
-        return inner_symbol or sym.get('raw_symbol') or 'N/A'
-    return str(sym) if sym else 'N/A'
 
 
 def _get_name_from_position(position, sym):
@@ -1648,11 +1576,7 @@ def _get_cached_account_balance():
     user = get_current_user()
     if not user:
         return None
-    stored = load_account_data().get(user['username'], {})
-    primary = stored.get('primary_account') or {}
-    accounts = stored.get('accounts') or []
-    if not primary and accounts:
-        primary = accounts[0]
+    primary = _get_stored_primary_account(user['username'])
     total = (primary.get('balance') or {}).get('total') or {}
     return _to_float(total.get('amount'), None)
 
@@ -1702,26 +1626,6 @@ def _watchlist_quote(symbol: str):
     return data
 
 
-def _batch_watchlist_quotes(symbols):
-    results = {}
-    for sym in list(dict.fromkeys(symbols)):
-        results[sym] = _watchlist_quote(sym)
-    return results
-
-
-@app.route('/api/symbols/quote', methods=['GET'])
-def get_symbol_quote():
-    """Return a cached mock quote for a single symbol."""
-    try:
-        symbol = (request.args.get('symbol') or '').upper().strip()
-        if not symbol:
-            return jsonify({'success': False, 'error': 'symbol required'}), 400
-        return jsonify({'success': True, 'data': _watchlist_quote(symbol)})
-    except Exception as e:
-        symbol = (request.args.get('symbol') or 'SYM').upper().strip()
-        return jsonify({'success': True, 'data': _mock_quote(symbol)})
-
-
 @app.route('/api/watchlist/quotes', methods=['GET'])
 def get_watchlist_quotes():
     """Return batched cached mock quotes for watchlist."""
@@ -1731,81 +1635,8 @@ def get_watchlist_quotes():
             symbols = [s.upper().strip() for s in symbols_param.split(',') if s.strip()]
         else:
             symbols = WATCHLIST[:]
-        batch_map = _batch_watchlist_quotes(symbols)
-        quotes = [batch_map[sym] for sym in symbols if sym in batch_map]
+        quotes = [_watchlist_quote(sym) for sym in dict.fromkeys(symbols)]
         return jsonify({'success': True, 'data': quotes})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/search', methods=['GET'])
-def search():
-    """Search holdings and watchlist by symbol/name"""
-    try:
-        q = (request.args.get('q') or '').lower().strip()
-        summary_resp = get_portfolio_summary().json
-        holdings = (summary_resp.get('data') or {}).get('holdings', []) if summary_resp else []
-        results = []
-        if q:
-            for h in holdings:
-                if q in str(h.get('symbol', '')).lower() or q in str(h.get('name', '')).lower():
-                    results.append({'type': 'holding', **h})
-            for s in WATCHLIST:
-                if q in s.lower():
-                    results.append({'type': 'watchlist', 'symbol': s})
-        return jsonify({'success': True, 'data': results})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-
-@app.route('/api/orders/preview', methods=['POST'])
-def order_preview():
-    """Preview an order cost (mock)"""
-    try:
-        payload = request.get_json(force=True)
-        symbol = (payload.get('symbol') or '').upper().strip()
-        side = (payload.get('side') or '').lower().strip()
-        quantity = int(payload.get('quantity') or 0)
-        if not symbol or side not in ('buy', 'sell') or quantity <= 0:
-            return jsonify({'success': False, 'error': 'symbol, side (buy/sell), quantity>0 required'}), 400
-        quote_resp = get_symbol_quote()
-        quote = quote_resp.json.get('data') if hasattr(quote_resp, 'json') else None
-        price = (quote or {}).get('price', 100)
-        est_cost = round(price * quantity * (1 if side == 'buy' else -1), 2)
-        fees = 0
-        return jsonify({'success': True, 'data': {'symbol': symbol, 'side': side, 'quantity': quantity, 'price': price, 'estimatedCost': est_cost, 'fees': fees}})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-
-@app.route('/api/orders/place', methods=['POST'])
-def order_place():
-    """Place an order (mock success)"""
-    try:
-        payload = request.get_json(force=True)
-        symbol = (payload.get('symbol') or '').upper().strip()
-        side = (payload.get('side') or '').lower().strip()
-        quantity = int(payload.get('quantity') or 0)
-        if not symbol or side not in ('buy', 'sell') or quantity <= 0:
-            return jsonify({'success': False, 'error': 'symbol, side (buy/sell), quantity>0 required'}), 400
-        NOTIFICATIONS.append({'type': 'order', 'message': f"{side.upper()} {quantity} {symbol}", 'time': datetime.now().isoformat()})
-        return jsonify({'success': True, 'data': {'orderId': f'ord_{int(datetime.now().timestamp())}', 'status': 'accepted'}})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-
-@app.route('/api/notifications', methods=['GET', 'POST', 'DELETE'])
-def notifications_handler():
-    try:
-        if request.method == 'GET':
-            return jsonify({'success': True, 'data': NOTIFICATIONS})
-        if request.method == 'POST':
-            payload = request.get_json(silent=True) or {}
-            msg = payload.get('message') or 'Test notification'
-            NOTIFICATIONS.append({'type': 'info', 'message': msg, 'time': datetime.now().isoformat()})
-            return jsonify({'success': True, 'data': NOTIFICATIONS})
-        if request.method == 'DELETE':
-            NOTIFICATIONS.clear()
-            return jsonify({'success': True, 'data': []})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -1896,71 +1727,21 @@ def explorer_meta():
             "users": users_meta,
         },
     })
-@app.route('/api/export/account-data', methods=['GET'])
-def export_account_data():
-    """Export all account data as JSON"""
-    try:
-        account_id = get_account_id()
-        if not account_id:
-            return jsonify({'success': False, 'error': 'No account found'}), 400
-        
-        # Get all account data
-        user_id, user_secret = get_user_credentials()
-        if not user_id or not user_secret:
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-        
-        snaptrade_client = get_snaptrade_client()
-        if not snaptrade_client:
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-        
-        accounts_response = snaptrade_client.account_information.list_user_accounts(
-            user_id=user_id,
-            user_secret=user_secret
-        )
-        
-        positions = get_portfolio_positions()
-        summary_resp = get_portfolio_summary()
-        summary = summary_resp.get_json().get('data', {}) if summary_resp else {}
-        
-        # Get Snaptrade reporting data
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=365)
-        reporting_data = None
-        try:
-            reporting_response = snaptrade_client.transactions_and_reporting.get_reporting_custom_range(
-                user_id=user_id,
-                user_secret=user_secret,
-                start_date=start_date.strftime('%Y-%m-%d'),
-                end_date=end_date.strftime('%Y-%m-%d')
-            )
-            reporting_data = reporting_response.body if reporting_response.body else None
-        except Exception as e:
-            print(f"Error fetching reporting data: {e}")
-        
-        export_data = {
-            'exportDate': datetime.now().isoformat(),
-            'accountId': account_id,
-            'accounts': accounts_response.body if accounts_response.body else [],
-            'positions': positions,
-            'summary': summary,
-            'snaptradeReporting': reporting_data,
-            'dataSource': 'Snaptrade API',
-            'note': 'This data is from your connected Snaptrade account (Alpaca Paper)'
-        }
-        
-        return jsonify({'success': True, 'data': export_data})
-        
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
 # ── PostgreSQL table endpoints ─────────────────────────────────────────────
+
+def _require_db_user():
+    user = get_current_user()
+    if not user:
+        return None, (jsonify({"success": False, "error": "Not authenticated"}), 401)
+    return user, None
+
 
 @app.route("/api/db/positions", methods=["GET"])
 @require_basic_auth
 def db_positions():
-    user = get_current_user()
-    if not user:
-        return jsonify({"success": False, "error": "Not authenticated"}), 401
+    _, err = _require_db_user()
+    if err:
+        return err
     rows = (
         db.session.query(Position, Account, User)
         .join(Account, Position.account_id == Account.id)
@@ -1987,9 +1768,9 @@ def db_positions():
 @app.route("/api/db/orders", methods=["GET"])
 @require_basic_auth
 def db_orders():
-    user = get_current_user()
-    if not user:
-        return jsonify({"success": False, "error": "Not authenticated"}), 401
+    _, err = _require_db_user()
+    if err:
+        return err
     rows = (
         db.session.query(Order, Account, User)
         .join(Account, Order.account_id == Account.id)
@@ -2017,9 +1798,9 @@ def db_orders():
 @app.route("/api/db/activities", methods=["GET"])
 @require_basic_auth
 def db_activities():
-    user = get_current_user()
-    if not user:
-        return jsonify({"success": False, "error": "Not authenticated"}), 401
+    _, err = _require_db_user()
+    if err:
+        return err
     rows = (
         db.session.query(Activity, Account, User)
         .join(Account, Activity.account_id == Account.id)
@@ -2045,9 +1826,9 @@ def db_activities():
 @app.route("/api/db/accounts", methods=["GET"])
 @require_basic_auth
 def db_accounts():
-    user = get_current_user()
-    if not user:
-        return jsonify({"success": False, "error": "Not authenticated"}), 401
+    _, err = _require_db_user()
+    if err:
+        return err
     rows = (
         db.session.query(Account, User)
         .join(User, Account.user_id == User.id)
@@ -2074,9 +1855,9 @@ def db_accounts():
 @require_basic_auth
 def db_sync_endpoint():
     """Manually trigger a DB sync from the existing JSON export."""
-    user = get_current_user()
-    if not user:
-        return jsonify({"success": False, "error": "Not authenticated"}), 401
+    _, err = _require_db_user()
+    if err:
+        return err
     try:
         stats = sync_export_to_db(verbose=True)
         return jsonify({"success": True, "stats": stats})

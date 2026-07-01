@@ -164,7 +164,6 @@ const PortfolioDashboard = () => {
   // Performance graph controls
   const [yAxisType, setYAxisType] = useState('dollar');
   const [benchmark, setBenchmark] = useState('none');
-  const [portfolioFilter, setPortfolioFilter] = useState('whole');
   const [benchmarkData, setBenchmarkData] = useState([]);
   const [timeframe, setTimeframe] = useState(30);
   const [availableStocks, setAvailableStocks] = useState([]);
@@ -321,7 +320,7 @@ const PortfolioDashboard = () => {
   useEffect(() => {
     fetchPortfolioHistory();
     if (benchmark !== 'none') {
-      fetchBenchmarkData(benchmark === 'custom' ? 'SPY' : benchmark);
+      fetchBenchmarkData(benchmark);
     } else {
       setBenchmarkData([]);
     }
@@ -794,14 +793,6 @@ const PortfolioDashboard = () => {
         <div className="mb-6 space-y-4">
           <div className="flex flex-wrap gap-4 items-center">
             <div className="flex items-center gap-2">
-              <label className="text-sm font-medium text-gray-700">Portfolio:</label>
-              <select value={portfolioFilter} onChange={(e) => setPortfolioFilter(e.target.value)}
-                className="px-3 py-1.5 border border-gray-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-                <option value="whole">Whole Portfolio</option>
-                <option value="risk">Risk Portfolio Only</option>
-              </select>
-            </div>
-            <div className="flex items-center gap-2">
               <label className="text-sm font-medium text-gray-700">Y-axis:</label>
               <select value={yAxisType} onChange={(e) => setYAxisType(e.target.value)}
                 className="px-3 py-1.5 border border-gray-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
@@ -815,7 +806,6 @@ const PortfolioDashboard = () => {
                 className="px-3 py-1.5 border border-gray-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
                 <option value="none">None</option>
                 <option value="SPY">Market Index (SPY)</option>
-                <option value="custom">Custom Portfolio</option>
               </select>
             </div>
             <button onClick={() => setShowStockFilter(!showStockFilter)}
@@ -979,7 +969,7 @@ const PortfolioDashboard = () => {
           {benchmark !== 'none' && (
             <div className="flex items-center gap-2">
               <div className="w-4 h-0.5 bg-green-500 border-dashed border-t-2"></div>
-              <span className="text-sm text-gray-600">Benchmark ({benchmark === 'custom' ? 'Custom' : benchmark})</span>
+              <span className="text-sm text-gray-600">Benchmark ({benchmark})</span>
             </div>
           )}
         </div>

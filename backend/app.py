@@ -9,10 +9,11 @@ import yfinance as yf
 import logging
 import hashlib
 import secrets
-import requests
-from requests.adapters import HTTPAdapter
 import re
 import glob
+import subprocess
+import sys
+import threading
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
@@ -51,13 +52,14 @@ USERS_DB_FILE = 'users.json'
 ACCOUNT_DATA_DIR = 'data-export'
 ACCOUNT_DATA_FILE = os.path.join(ACCOUNT_DATA_DIR, 'account-data.json')
 
+DATABASE_DIR = os.path.join(os.path.dirname(__file__), 'database')
 
-from models import db, User, Account, Position, Order, Activity
-from db_sync import sync_export_to_db
+from database.models import db, User, Account, Position, Order, Activity
+from database.db_sync import sync_export_to_db
 
 # PostgreSQL: set DATABASE_URL=postgresql+psycopg://user:pass@localhost/dbname
 # Local dev default uses SQLite (no Postgres install required).
-_default_db_path = os.path.join(os.path.dirname(__file__), 'portfolio.db')
+_default_db_path = os.path.join(DATABASE_DIR, 'portfolio.db')
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get(
     'DATABASE_URL',
     f'sqlite:///{_default_db_path}'
@@ -138,16 +140,6 @@ def _symbol_from_activity(activity):
     return raw
 
 
-def _description_from_activity(activity, symbol):
-    raw = activity.get('symbol')
-    if isinstance(raw, dict):
-        inner = raw.get('symbol')
-        if isinstance(inner, dict):
-            return inner.get('description') or raw.get('description') or symbol
-        return raw.get('description') or symbol
-    return symbol
-
-
 def _load_full_export() -> dict:
     """Read the full export JSON; fall back to the newest dated export snapshot."""
     candidates = []
@@ -174,104 +166,13 @@ def _load_full_export() -> dict:
     return {}
 
 
-def _get_user_account_wrappers(export=None, account_id=None):
-    """Return export account wrappers scoped to the logged-in user/account."""
-    user = get_current_user()
-    if not user:
-        return []
-
-    username = user['username']
-    if account_id is None:
-        account_id = get_account_id()
-
-    export = export or _load_full_export()
-    if not export:
-        return []
-
-    if 'users' in export:
-        for user_entry in export.get('users', []):
-            if user_entry.get('username') == username:
-                return user_entry.get('accounts', [])
-        return []
-
-    wrappers = []
-    for wrapper in export.get('accounts', []):
-        acc = wrapper.get('account', {})
-        if account_id:
-            if acc.get('id') == account_id:
-                wrappers.append(wrapper)
-        else:
-            wrappers.append(wrapper)
-    return wrappers
-
-
-def _positions_from_export_wrappers(wrappers):
-    """Reconstruct open positions from export wrappers for one account."""
-    symbol_map = {}
-
-    for acc_wrapper in wrappers:
-        export_positions = acc_wrapper.get('positions') or []
-        if export_positions:
-            return export_positions
-
-        activities = acc_wrapper.get('activities', {})
-        txns = activities.get('data', []) if isinstance(activities, dict) else []
-
-        for txn in txns:
-            symbol = _symbol_from_activity(txn)
-            if not symbol:
-                continue
-
-            units = float(txn.get('units') or 0)
-            price = float(txn.get('price') or 0)
-            description = _description_from_activity(txn, symbol)
-
-            if symbol not in symbol_map:
-                symbol_map[symbol] = {
-                    'symbol': symbol,
-                    'description': description,
-                    'units': 0.0,
-                    'total_cost': 0.0,
-                    'last_price': price,
-                }
-
-            symbol_map[symbol]['units'] += units
-            if units > 0:
-                symbol_map[symbol]['total_cost'] += units * price
-            if price > 0:
-                symbol_map[symbol]['last_price'] = price
-
-    positions = []
-    for sym, data in symbol_map.items():
-        net_units = round(data['units'], 6)
-        if net_units > 0.0001:
-            avg_cost = data['total_cost'] / net_units if net_units else 0
-            positions.append({
-                'symbol': sym,
-                'units': net_units,
-                'price': data['last_price'],
-                'average_purchase_price': avg_cost,
-                'description': data['description'],
-            })
-    return positions
-
 WATCHLIST = [
     'AAPL','MSFT','GOOGL','AMZN','NVDA','META','TSLA','BRK.B','JPM','V',
     'XOM','UNH','JNJ','PG',
     'SPY','QQQ','VOO','VTI','IWM','DIA'
 ]
-SAFE_ASSETS = {
-    'SPY','VOO','VTI','QQQ','IWM','DIA','SCHB','ITOT','VT',
-    'SCHX','SCHA','SCHM','VB','VO','VV','MGC','MGK','MGV',
-    'BND','AGG','TLT','IEF','SHY','VCIT','LQD','BNDX',
-    'VCSH','VGSH','VGIT','VGLT','BSV','BIV','BLV',
-    'MUB','HYG','JNK','EMB','TIP','SCHZ',
-    'SPAXX','FDRXX','VMFXX','SGOV','BIL','SHV','CLTL',
-    'GBIL','TFLO','ICSH','NEAR',
-}
 QUOTE_CACHE = {}
 QUOTE_TTL_SECONDS = 60
-USE_YAHOO = (os.getenv('USE_YAHOO', '0') == '1')
 
 # Reduce noisy yfinance logging
 try:
@@ -310,13 +211,6 @@ def _resolve_history_window(days_param, first_date=None):
     window_start = end_day - timedelta(days=max(days - 1, 0))
     chart_start = max(window_start, first_date) if first_date else window_start
     return days, False, chart_start
-
-
-def _clip_history_to_window(history, chart_start):
-    if not history:
-        return []
-    start_str = chart_start.isoformat() if hasattr(chart_start, 'isoformat') else str(chart_start)[:10]
-    return [point for point in history if point.get('date', '') >= start_str]
 
 
 def _get_account_first_transaction_date(account_id):
@@ -435,7 +329,12 @@ def _build_portfolio_history_from_activities(activities, chart_start, selected_s
         symbols = {sym for sym in symbols if sym in selected_symbols}
 
     price_series = {}
-    start_fetch = datetime.combine(chart_start, datetime.min.time())
+    # Fetch prices before chart_start so forward-fill has prior closes on the first days
+    # of the window (avoids cash-only undervaluation and sudden jumps on 3M/6M views).
+    price_fetch_start = chart_start - timedelta(days=30)
+    if first_day:
+        price_fetch_start = min(price_fetch_start, first_day)
+    start_fetch = datetime.combine(price_fetch_start, datetime.min.time())
     end_fetch = datetime.combine(end_day, datetime.min.time())
     for sym in symbols:
         price_series[sym] = _fetch_symbol_daily_closes(sym, start_fetch, end_fetch)
@@ -476,57 +375,6 @@ def _build_portfolio_history_from_activities(activities, chart_start, selected_s
         day += timedelta(days=1)
 
     return history
-
-
-def _fetch_snaptrade_equity_history(account_id=None, chart_start=None, days=30):
-    """Load account equity history from SnapTrade reporting (actual portfolio value)."""
-    try:
-        user_id, user_secret = get_user_credentials()
-        if not user_id or not user_secret:
-            return []
-
-        end_date = datetime.now()
-        if chart_start:
-            if isinstance(chart_start, datetime):
-                start_date = chart_start
-            else:
-                start_date = datetime.combine(chart_start, datetime.min.time())
-        else:
-            start_date = end_date - timedelta(days=days)
-        snaptrade_client = get_snaptrade_client()
-        response = snaptrade_client.transactions_and_reporting.get_reporting_custom_range(
-            user_id=user_id,
-            user_secret=user_secret,
-            start_date=start_date.strftime('%Y-%m-%d'),
-            end_date=end_date.strftime('%Y-%m-%d'),
-            accounts=account_id,
-            detailed=True,
-            frequency='daily',
-        )
-        body = response.body if response.body else {}
-        if not isinstance(body, dict):
-            return []
-
-        points = body.get('totalEquityTimeframe') or []
-        history = []
-        for point in points:
-            if not isinstance(point, dict):
-                continue
-            date_value = point.get('date')
-            amount = point.get('value')
-            if date_value is None or amount is None:
-                continue
-            if hasattr(date_value, 'strftime'):
-                date_str = date_value.strftime('%Y-%m-%d')
-            else:
-                date_str = str(date_value)[:10]
-            history.append({'date': date_str, 'value': round(float(amount), 2)})
-
-        history.sort(key=lambda item: item['date'])
-        return history
-    except Exception as e:
-        print(f"Error fetching SnapTrade equity history: {e}")
-        return []
 
 
 def _fetch_symbol_daily_closes(symbol, start_date, end_date):
@@ -587,7 +435,7 @@ def get_account_id():
 
 
 def get_portfolio_positions():
-    """Get positions from live SnapTrade API, with user-scoped export fallback."""
+    """Get positions from live SnapTrade API."""
     try:
         account_id = get_account_id()
         user_id, user_secret = get_user_credentials()
@@ -598,13 +446,7 @@ def get_portfolio_positions():
                 user_secret=user_secret,
                 account_id=account_id,
             )
-            body = positions_response.body if positions_response.body else []
-            if body:
-                return body
-
-        wrappers = _get_user_account_wrappers(account_id=account_id)
-        if wrappers:
-            return _positions_from_export_wrappers(wrappers)
+            return positions_response.body if positions_response.body else []
     except Exception as e:
         print(f"Error getting positions: {e}")
     return []
@@ -722,14 +564,14 @@ def get_portfolio_summary():
                     position, row['symbol'], meta.get('assetType')
                 ),
                 'sector': meta.get('sector') or 'Unknown',
-                'isSafeAsset': row['symbol'] in SAFE_ASSETS,
             })
 
         account_total = _get_account_total_balance()
         if account_total is not None:
             cash_balance = max(0.0, account_total - total_value)
         else:
-            cash_balance = _get_cash_balance_from_export()
+            cached_total = _get_cached_account_balance()
+            cash_balance = max(0.0, cached_total - total_value) if cached_total is not None else 0.0
 
         total_gain_loss = total_value - total_cost
         total_return = (total_gain_loss / total_cost * 100) if total_cost > 0 else 0
@@ -1019,10 +861,7 @@ def _build_user_profile(user):
         holdings_sync = sync_status.get('holdings') or {}
         transactions_sync = sync_status.get('transactions') or {}
         meta = primary.get('meta') or {}
-        export_balance = _to_float(primary.get('_export_cash'), None)
         total_balance = _to_float(total.get('amount'), None)
-        if total_balance is None:
-            total_balance = export_balance
 
         profile['brokerage'] = {
             'institutionName': primary.get('institution_name') or meta.get('institution_name'),
@@ -1052,70 +891,6 @@ def auth_profile():
         'data': _build_user_profile(user),
     })
 
-
-def _format_transaction_type(activity):
-    """Format transaction type for better display"""
-    activity_type = activity.get('type', '').upper()
-    
-    # Handle specific type codes from Snaptrade/Alpaca
-    if activity_type == 'JNLC':
-        return 'DEPOSIT'
-    if activity_type == 'JNLS':
-        return 'WITHDRAWAL'
-    if activity_type in ('FEE', 'FEES'):
-        return 'FEE'
-    if activity_type in ('DIV', 'DIVIDEND'):
-        return 'DIVIDEND'
-    if activity_type in ('INT', 'INTEREST'):
-        return 'INTEREST'
-    if activity_type in ('BUY', 'SELL'):
-        return activity_type
-    
-    # Default to original type
-    return activity_type if activity_type else 'OTHER'
-
-def _format_transaction_description(activity, formatted_type):
-    """Format transaction description for better readability"""
-    description = activity.get('description', '').strip()
-    amount = activity.get('amount', 0)
-    symbol = activity.get('symbol', '')
-    
-    # Normalize symbol - remove "N/A"
-    if symbol == 'N/A':
-        symbol = ''
-    
-    # Format based on type
-    if formatted_type == 'DEPOSIT':
-        if description:
-            return description
-        return f'Deposit of ${abs(amount):,.2f}'
-    
-    if formatted_type == 'WITHDRAWAL':
-        if description:
-            return description
-        return f'Withdrawal of ${abs(amount):,.2f}'
-    
-    if formatted_type == 'FEE':
-        if description:
-            return description
-        return f'Trading fee: ${abs(amount):,.2f}'
-    
-    if formatted_type in ('DIVIDEND', 'INTEREST'):
-        if description:
-            return description
-        if symbol:
-            return f'{formatted_type.title()} from {symbol}'
-        return f'{formatted_type.title()} payment'
-    
-    # For trades (BUY/SELL), the description from the API is already well-formatted
-    if description:
-        return description
-    
-    # Fallback if no description
-    if symbol:
-        return f'{symbol} {formatted_type}'
-    
-    return f'{formatted_type} transaction'
 
 def _parse_transaction_description(description, symbol):
     """Parse transaction description to separate action type from details"""
@@ -1340,24 +1115,6 @@ def _append_option_order_row(rows, order, matched_fee=0.0):
     return True
 
 
-def _load_option_orders_from_latest_export():
-    """Fallback: load option orders from export scoped to the logged-in user."""
-    try:
-        rows = []
-        for acc_wrapper in _get_user_account_wrappers():
-            orders = acc_wrapper.get('orders', []) if isinstance(acc_wrapper, dict) else []
-            for order in orders:
-                option_symbol = order.get('option_symbol')
-                if not isinstance(option_symbol, dict):
-                    continue
-                matched_fee = 0.0
-                _append_option_order_row(rows, order, matched_fee)
-        return rows
-    except Exception as export_err:
-        print(f"Error loading option orders from export: {export_err}")
-        return []
-
-
 def _snaptrade_activities_page_items(page_body):
     """
     Account-level activities return PaginatedUniversalActivity: { "data": [...], "pagination": {...} }.
@@ -1492,7 +1249,6 @@ def get_transactions():
 
         # Option orders from primary account only (same account_id as activities above).
         seen_order_ids = set()
-        order_rows_added = 0
         if account_id:
             try:
                 orders_response = snaptrade_client.account_information.get_user_account_orders(
@@ -1555,16 +1311,11 @@ def get_transactions():
                     if _append_option_order_row(option_order_rows, order, matched_fee):
                         if order_id:
                             seen_order_ids.add(order_id)
-                        order_rows_added += 1
 
                 transactions.extend(option_order_rows)
             except Exception as order_err:
                 print(f"Error getting option orders: {order_err}")
 
-        # Fallback to exported JSON snapshot when API order fetch returns nothing.
-        if order_rows_added == 0:
-            transactions.extend(_load_option_orders_from_latest_export())
-        
         # Sort transactions by date (descending), then by time (descending), then by symbol (ascending)
         transactions.sort(key=lambda x: (
             -datetime.fromisoformat(x['date'].replace('Z', '+00:00')).timestamp() if x['date'] else 0,
@@ -1638,21 +1389,6 @@ def get_portfolio_history():
         first_date = _get_account_first_transaction_date(account_id) if account_id else None
         end_day = datetime.now().date()
         days, show_all, chart_start = _resolve_history_window(days_param, first_date)
-
-        if not selected_symbols:
-            reporting_history = _fetch_snaptrade_equity_history(
-                account_id=account_id,
-                chart_start=chart_start,
-                days=days,
-            )
-            reporting_history = _clip_history_to_window(reporting_history, chart_start)
-            if reporting_history:
-                return jsonify({
-                    'success': True,
-                    'data': reporting_history,
-                    'source': 'snaptrade_reporting',
-                    'timeframe': 'all' if show_all else days,
-                })
 
         if account_id and user_id and user_secret:
             snaptrade_client = get_snaptrade_client()
@@ -1792,8 +1528,6 @@ def _get_inner_symbol_type(position):
 def _asset_type_from_position(position, symbol, yf_asset_type=None):
     if position.get('cash_equivalent'):
         return 'Cash Equivalent'
-    if isinstance(symbol, str) and symbol in SAFE_ASSETS:
-        return 'ETF'
     type_obj = _get_inner_symbol_type(position)
     code = (type_obj.get('code') or '').lower()
     desc = (type_obj.get('description') or '').strip()
@@ -1909,72 +1643,24 @@ def _get_account_total_balance():
         return None
 
 
-def _get_cash_balance_from_export():
-    try:
-        account_id = get_account_id()
-        user_id, user_secret = get_user_credentials()
-        if account_id and user_id and user_secret:
-            snaptrade_client = get_snaptrade_client()
-            response = snaptrade_client.account_information.get_user_account_details(
-                user_id=user_id,
-                user_secret=user_secret,
-                account_id=account_id,
-            )
-            details = response.body if response.body else {}
-            balance = details.get('balance') or {}
-            total = balance.get('total') or {}
-            amount = _to_float(total.get('amount'), None)
-            if amount is not None:
-                return max(0.0, amount)
-
-            balance_response = snaptrade_client.account_information.get_user_account_balance(
-                user_id=user_id,
-                user_secret=user_secret,
-                account_id=account_id,
-            )
-            balances = balance_response.body if balance_response.body else []
-            if balances:
-                cash = _to_float(balances[0].get('cash'), None)
-                if cash is not None:
-                    return max(0.0, cash)
-    except Exception as e:
-        print(f"Error getting live cash balance: {e}")
-
-    for acc_wrapper in _get_user_account_wrappers():
-        balances = acc_wrapper.get('balances') or [{}]
-        bal = balances[0] if balances else {}
-        cash = _to_float(bal.get('cash'), None)
-        if cash is not None:
-            return max(0.0, cash)
-        account = acc_wrapper.get('account') or {}
-        total = (account.get('balance') or {}).get('total') or {}
-        amount = _to_float(total.get('amount'), None)
-        if amount is not None:
-            return max(0.0, amount)
-
-    return 0.0
+def _get_cached_account_balance():
+    """Read account total balance from account-data.json cache."""
+    user = get_current_user()
+    if not user:
+        return None
+    stored = load_account_data().get(user['username'], {})
+    primary = stored.get('primary_account') or {}
+    accounts = stored.get('accounts') or []
+    if not primary and accounts:
+        primary = accounts[0]
+    total = (primary.get('balance') or {}).get('total') or {}
+    return _to_float(total.get('amount'), None)
 
 
-@app.route('/api/watchlist', methods=['GET', 'POST', 'DELETE'])
-def watchlist_handler():
-    """Simple in-memory watchlist"""
-    try:
-        if request.method == 'GET':
-            return jsonify({'success': True, 'data': WATCHLIST})
-        payload = request.get_json(silent=True) or {}
-        symbol = (payload.get('symbol') or '').upper().strip()
-        if not symbol:
-            return jsonify({'success': False, 'error': 'symbol required'}), 400
-        if request.method == 'POST':
-            if symbol not in WATCHLIST:
-                WATCHLIST.append(symbol)
-            return jsonify({'success': True, 'data': WATCHLIST})
-        if request.method == 'DELETE':
-            if symbol in WATCHLIST:
-                WATCHLIST.remove(symbol)
-            return jsonify({'success': True, 'data': WATCHLIST})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+@app.route('/api/watchlist', methods=['GET'])
+def get_watchlist():
+    """Return the static watchlist symbols."""
+    return jsonify({'success': True, 'data': WATCHLIST})
 
 
 def _quote_from_cache(symbol: str):
@@ -2007,103 +1693,46 @@ def _normalize_symbol_for_yf(symbol: str) -> str:
     return symbol.replace('.', '-')
 
 
-def _fetch_quote_yf(symbol: str):
-    if not USE_YAHOO:
-        return _quote_from_cache(symbol) or _mock_quote(symbol)
+def _watchlist_quote(symbol: str):
     cached = _quote_from_cache(symbol)
     if cached:
         return cached
-    yn = _normalize_symbol_for_yf(symbol)
-    price = None
-    prev_close = None
-    name = None
-    try:
-        hist = yf.Ticker(yn).history(period='5d', interval='1d', auto_adjust=False)
-        if hist is not None and len(hist.index) > 0 and 'Close' in hist:
-            closes = hist['Close'].dropna()
-            if len(closes) >= 1:
-                price = float(closes.iloc[-1])
-            if len(closes) >= 2:
-                prev_close = float(closes.iloc[-2])
-    except Exception:
-        pass
-    if price is None:
-        try:
-            fi = getattr(yf.Ticker(yn), 'fast_info', None) or {}
-            price = fi.get('last_price') or fi.get('last_trade_price')
-            prev_close = prev_close if prev_close is not None else fi.get('previous_close')
-        except Exception:
-            pass
-    change_pct = 0.0
-    if price is None or (isinstance(price, float) and not price):
-        data = _mock_quote(symbol)
-        _store_quote_cache(symbol, data)
-        return data
-    if prev_close not in (None, 0):
-        change_pct = ((price - prev_close) / prev_close) * 100.0
-    data = {
-        'symbol': symbol,
-        'name': name or symbol,
-        'price': round(float(price or 0), 2),
-        'changePercent': round(float(change_pct), 2),
-        'updated': datetime.now().isoformat()
-    }
+    data = _mock_quote(symbol)
     _store_quote_cache(symbol, data)
     return data
 
 
-def _batch_quotes_yf(symbols):
-    """Fetch quotes with per-symbol lightweight history method"""
+def _batch_watchlist_quotes(symbols):
     results = {}
-    if not symbols:
-        return results
-    symbols = list(dict.fromkeys(symbols))[:10]
-    for sym in symbols:
-        cached = _quote_from_cache(sym)
-        if cached:
-            results[sym] = cached
-            continue
-        if not USE_YAHOO:
-            results[sym] = _mock_quote(sym)
-            continue
-        try:
-            results[sym] = _fetch_quote_yf(sym)
-        except Exception:
-            results[sym] = _quote_from_cache(sym) or _mock_quote(sym)
+    for sym in list(dict.fromkeys(symbols)):
+        results[sym] = _watchlist_quote(sym)
     return results
+
+
 @app.route('/api/symbols/quote', methods=['GET'])
 def get_symbol_quote():
-    """Return a cached or live quote for a single symbol"""
+    """Return a cached mock quote for a single symbol."""
     try:
         symbol = (request.args.get('symbol') or '').upper().strip()
         if not symbol:
             return jsonify({'success': False, 'error': 'symbol required'}), 400
-        data = _fetch_quote_yf(symbol)
-        return jsonify({'success': True, 'data': data})
+        return jsonify({'success': True, 'data': _watchlist_quote(symbol)})
     except Exception as e:
-        cached = _quote_from_cache(symbol) if 'symbol' in locals() else None
-        return jsonify({'success': True, 'data': cached or _mock_quote(symbol if 'symbol' in locals() else 'SYM')})
+        symbol = (request.args.get('symbol') or 'SYM').upper().strip()
+        return jsonify({'success': True, 'data': _mock_quote(symbol)})
+
+
 @app.route('/api/watchlist/quotes', methods=['GET'])
 def get_watchlist_quotes():
-    """Return batched quotes for watchlist"""
+    """Return batched cached mock quotes for watchlist."""
     try:
         symbols_param = request.args.get('symbols')
-        symbols = []
         if symbols_param:
             symbols = [s.upper().strip() for s in symbols_param.split(',') if s.strip()]
         else:
             symbols = WATCHLIST[:]
-        batch_map = _batch_quotes_yf(symbols)
-        quotes = []
-        for sym in symbols:
-            if sym in batch_map:
-                quotes.append(batch_map[sym])
-                continue
-            try:
-                quotes.append(_fetch_quote_yf(sym))
-            except Exception:
-                cached = _quote_from_cache(sym)
-                quotes.append(cached or _mock_quote(sym))
+        batch_map = _batch_watchlist_quotes(symbols)
+        quotes = [batch_map[sym] for sym in symbols if sym in batch_map]
         return jsonify({'success': True, 'data': quotes})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -2199,20 +1828,6 @@ def health_check():
         'status': 'healthy',
         'timestamp': datetime.now().isoformat()
     })
-"""
-flask_explorer_routes.py
-────────────────────────
-Paste these routes into your existing app.py (after your imports / helpers).
-
-They serve the snaptrade_full_export.json file produced by
-snaptrade_export_all.py, and expose a trigger endpoint so an admin
-can refresh the export on demand from the UI.
-"""
-
-import subprocess
-import threading
-
-EXPORT_FILE = os.path.join(ACCOUNT_DATA_DIR, "snaptrade_full_export.json")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2222,10 +1837,6 @@ EXPORT_FILE = os.path.join(ACCOUNT_DATA_DIR, "snaptrade_full_export.json")
 @app.route("/api/explorer/data", methods=["GET"])
 @require_basic_auth
 def explorer_get_data():
-    # user = get_current_user()
-    # if not user:
-    #     return jsonify({"success": False, "error": "Not authenticated"}), 401
-
     data = _load_full_export()
     if not data:
         return jsonify({
@@ -2244,13 +1855,10 @@ def explorer_get_data():
 @app.route("/api/explorer/refresh", methods=["POST"])
 @require_basic_auth
 def explorer_refresh():
-    user = get_current_user()
-    # if not user:
-        # return jsonify({"success": False, "error": "Not authenticated"}), 401
-
     def _run():
         try:
-            subprocess.run(["python", "snaptrade_export_all.py"], timeout=120, check=True)
+            export_script = os.path.join(DATABASE_DIR, 'snaptrade_export_all.py')
+            subprocess.run([sys.executable, export_script], timeout=120, check=True, cwd=os.path.dirname(__file__))
             print("[explorer] Export done, syncing to DB...")
             with app.app_context():
                 sync_export_to_db(verbose=True)
@@ -2268,10 +1876,6 @@ def explorer_refresh():
 @app.route("/api/explorer/meta", methods=["GET"])
 @require_basic_auth
 def explorer_meta():
-    # user = get_current_user()
-    # if not user:
-    #     return jsonify({"success": False, "error": "Not authenticated"}), 401
-
     data = _load_full_export()
     if not data:
         return jsonify({"success": True, "data": {"exported_at": None, "users": []}})
@@ -2315,7 +1919,8 @@ def export_account_data():
         )
         
         positions = get_portfolio_positions()
-        summary = get_portfolio_summary().json.get('data', {}) if get_portfolio_summary() else {}
+        summary_resp = get_portfolio_summary()
+        summary = summary_resp.get_json().get('data', {}) if summary_resp else {}
         
         # Get Snaptrade reporting data
         end_date = datetime.now()

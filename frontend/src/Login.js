@@ -32,11 +32,7 @@ const Login = ({ onLogin }) => {
       } else {
         const { data } = await axios.post(
           `${API_URL}/auth/register`,
-          {
-            username,
-            password,
-            snaptrade_user_id: username
-          },
+          { username, password },
           { withCredentials: true }
         );
 
